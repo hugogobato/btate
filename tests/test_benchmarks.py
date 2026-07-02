@@ -26,6 +26,10 @@ from btate.benchmarks.maroulas_diagnostics import (
     pre_fgp_maroulas_diagnostic,
     strip_diagnostic_arrays,
 )
+from btate.benchmarks.joint_calibration import (
+    JointCalibrationCell,
+    run_joint_calibration,
+)
 
 
 def _fast_pipe(**kw) -> PipelineConfig:
@@ -188,6 +192,36 @@ def test_maroulas_sigma_sensitivity_strips_arrays():
     assert len(compact) == 2
     assert all("sigma_setting" in row for row in compact)
     assert all(not any(k.startswith("_") for k in row) for row in compact)
+
+
+def test_joint_calibration_runs_tiny():
+    pytest.importorskip("bayes_tda")
+    synth = SyntheticConfig(n=6, num_pts=45, effect_size=0.10, noise_level=0.8, seed=12)
+    pipe = _fast_pipe(
+        topo_method="maroulas",
+        weights="power",
+        posterior_draws=1,
+        resolution=12,
+        propagation="nested",
+        n_causal_draws=4,
+        n_plugin_draws=8,
+        n_inducing=6,
+        sigma_dyo=None,
+    )
+    cell = JointCalibrationCell(
+        "tiny",
+        synth,
+        pipe,
+        n_reps=1,
+        sigma_multipliers=(1.0,),
+        fgp_scales=(2.0, 4.0),
+        mc_realizations=2,
+    )
+    summary, raw = run_joint_calibration(cell, n_jobs=1)
+    assert len(raw) == 2
+    assert len(summary) == 2
+    assert {row["fgp_posterior_scale"] for row in summary} == {2.0, 4.0}
+    assert all("topo_l2_attenuation_ratio" in row for row in summary)
 
 
 def test_plugin_only_propagation():

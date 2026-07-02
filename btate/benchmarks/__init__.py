@@ -61,6 +61,9 @@ def __getattr__(name):  # PEP 562 lazy access to the heavier submodules
         "pre_fgp_maroulas_diagnostic": "maroulas_diagnostics",
         "maroulas_sigma_sensitivity": "maroulas_diagnostics",
         "strip_diagnostic_arrays": "maroulas_diagnostics",
+        "JointCalibrationCell": "joint_calibration",
+        "run_joint_calibration": "joint_calibration",
+        "aggregate_joint_records": "joint_calibration",
     }
     if name in submodules:
         mod = importlib.import_module(f"{__name__}.{submodules[name]}")

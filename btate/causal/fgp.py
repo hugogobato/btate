@@ -157,7 +157,14 @@ def _normalize_weights(weight: np.ndarray) -> np.ndarray:
 
 @dataclass
 class _BayesianLinearFit:
-    """Conjugate Bayesian linear regression posterior on kernel features."""
+    """Conjugate Bayesian linear regression posterior on kernel features.
+
+    ``coef_cov`` is the covariance actually used for coefficient draws: the
+    naive conjugate posterior covariance under fixed ``posterior_scale``, or
+    the Godambe/sandwich-adjusted covariance under ``posterior_scale="godambe"``
+    (in which case ``posterior_scale`` is 1 and ``scale_hat`` records the
+    implied inflation relative to the naive covariance).
+    """
 
     coef_mean: np.ndarray
     coef_cov: np.ndarray
@@ -165,6 +172,7 @@ class _BayesianLinearFit:
     prior_scale: float
     jitter: float
     posterior_scale: float = 1.0
+    scale_hat: float = float("nan")
 
     def draw_coefficients(self, n_draws: int, rng: np.random.Generator) -> np.ndarray:
         cov = self.posterior_scale * self.coef_cov + self.jitter * np.eye(self.coef_cov.shape[0])
@@ -316,6 +324,19 @@ class FunctionalGPEstimator:
         over-confident bands for the *curve-level* average ``psi_d(t)``.  Setting
         ``posterior_scale > 1`` widens the posterior draws to restore calibration
         (the Phase-4 benchmark selects it via ``PipelineConfig.fgp_posterior_scale``).
+
+        Pass the string ``"godambe"`` to *estimate* the correction instead of
+        fixing it: the coefficient covariance is replaced by the
+        cluster-robust (by-subject) Godambe/sandwich covariance
+        ``A^{-1} B A^{-1}``, where ``A`` is the working-independence posterior
+        precision and ``B`` sums outer products of per-subject score
+        contributions.  This is the standard curvature adjustment for
+        composite/working-independence likelihoods (Pauli, Racugno & Ventura
+        2011; Ribatet, Cooley & Davison 2012): it adapts automatically to the
+        grid resolution, temporal length-scale, sample size, and residual
+        correlation, removing the hand-tuned knob.  The implied scalar
+        inflation is recorded per fit as ``scale_hat`` (audit via
+        ``posterior_scale_hat_``).
     """
 
     def __init__(
@@ -329,7 +350,7 @@ class FunctionalGPEstimator:
         noise_variance: float | None = None,
         propensity_clip: float = 0.01,
         jitter: float = 1e-8,
-        posterior_scale: float = 1.0,
+        posterior_scale: float | str = 1.0,
     ):
         if int(n_inducing) < 1:
             raise ValueError("n_inducing must be positive")
@@ -341,9 +362,14 @@ class FunctionalGPEstimator:
             raise ValueError("noise_variance must be positive")
         if not (0.0 < propensity_clip < 0.5):
             raise ValueError("propensity_clip must lie in (0, 0.5)")
-        if posterior_scale <= 0:
-            raise ValueError("posterior_scale must be positive")
-        self.posterior_scale = float(posterior_scale)
+        if isinstance(posterior_scale, str):
+            if posterior_scale != "godambe":
+                raise ValueError("posterior_scale must be a positive float or 'godambe'")
+            self.posterior_scale = posterior_scale
+        else:
+            if posterior_scale <= 0:
+                raise ValueError("posterior_scale must be positive")
+            self.posterior_scale = float(posterior_scale)
         self.n_inducing = int(n_inducing)
         self.use_fpca = bool(use_fpca)
         self.fpca_components = int(fpca_components)
@@ -406,8 +432,13 @@ class FunctionalGPEstimator:
         rng = _as_rng(random_state)
         if self.use_fpca:
             self._fit_fpca_mode(curves, A_arr, X_std, rng)
+            hats = [m.scale_hat for fit in self.score_arm_fits_.values()
+                    for m in fit.models]
         else:
             self._fit_joint_mode(curves, A_arr, X_std, t_std, rng)
+            hats = [fit.model.scale_hat for fit in self.arm_fits_.values()]
+        hats = [h for h in hats if np.isfinite(h)]
+        self.posterior_scale_hat_ = float(np.mean(hats)) if hats else float("nan")
         self._is_fit = True
         return self
 
@@ -443,6 +474,8 @@ class FunctionalGPEstimator:
                 "n_inducing": self.n_inducing,
                 "n_subjects": int(self.A_.shape[0]),
                 "propensity_clip": self.propensity_clip,
+                "posterior_scale": self.posterior_scale,
+                "posterior_scale_hat": self.posterior_scale_hat_,
             },
         )
 
@@ -486,7 +519,7 @@ class FunctionalGPEstimator:
                 X_rep, t_rep, inducing_x, inducing_t,
                 self.length_scale_x_, self.length_scale_t_,
             )
-            model = self._fit_blr(features, y, row_weight)
+            model = self._fit_blr(features, y, row_weight, group_size=t_std.shape[0])
             self.arm_fits_[arm] = _JointArmFit(
                 model=model,
                 inducing_x=inducing_x,
@@ -530,7 +563,10 @@ class FunctionalGPEstimator:
         features: np.ndarray,
         y: np.ndarray,
         weight: np.ndarray,
+        group_size: int = 1,
     ) -> _BayesianLinearFit:
+        """Weighted conjugate BLR; rows must be contiguous blocks of
+        ``group_size`` per subject (subject-major) for the sandwich correction."""
         weight = _normalize_weights(weight)
         prior_var = self.prior_scale ** 2
         noise = self.noise_variance
@@ -550,14 +586,57 @@ class FunctionalGPEstimator:
         coef_mean = np.linalg.solve(precision, rhs)
         coef_cov = np.linalg.inv(precision)
         coef_cov = 0.5 * (coef_cov + coef_cov.T)
+
+        if self.posterior_scale == "godambe":
+            draw_cov, scale_hat = self._godambe_cov(
+                features, y, scaled_weight, coef_mean, coef_cov, group_size,
+            )
+            posterior_scale = 1.0
+        else:
+            draw_cov = coef_cov
+            scale_hat = float("nan")
+            posterior_scale = float(self.posterior_scale)
         return _BayesianLinearFit(
             coef_mean=coef_mean,
-            coef_cov=coef_cov,
+            coef_cov=draw_cov,
             noise_variance=float(noise),
             prior_scale=self.prior_scale,
             jitter=self.jitter,
-            posterior_scale=self.posterior_scale,
+            posterior_scale=posterior_scale,
+            scale_hat=scale_hat,
         )
+
+    @staticmethod
+    def _godambe_cov(
+        features: np.ndarray,
+        y: np.ndarray,
+        scaled_weight: np.ndarray,
+        coef_mean: np.ndarray,
+        coef_cov: np.ndarray,
+        group_size: int,
+    ) -> tuple[np.ndarray, float]:
+        """Cluster-robust (by-subject) sandwich covariance ``A^{-1} B A^{-1}``.
+
+        ``A^{-1}`` is the naive working-independence posterior covariance
+        (``coef_cov``); ``B`` sums outer products of per-subject likelihood
+        scores at the posterior mean, so within-curve residual correlation is
+        absorbed without assuming its form.
+        """
+        resid = y - features @ coef_mean
+        scored = features * (scaled_weight * resid)[:, None]     # per-row scores
+        n_rows = scored.shape[0]
+        group_size = max(1, int(group_size))
+        n_groups = n_rows // group_size
+        scores = scored[: n_groups * group_size].reshape(
+            n_groups, group_size, -1).sum(axis=1)                # per-subject scores
+        B = scores.T @ scores
+        if n_groups > 1:
+            B *= n_groups / (n_groups - 1.0)                     # small-sample factor
+        sandwich = coef_cov @ B @ coef_cov
+        sandwich = 0.5 * (sandwich + sandwich.T)
+        denom = float(np.trace(coef_cov))
+        scale_hat = float(np.trace(sandwich) / denom) if denom > 0 else float("nan")
+        return sandwich, scale_hat
 
     def _draw_tate_joint(
         self,

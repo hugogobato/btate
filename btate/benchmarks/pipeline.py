@@ -24,7 +24,7 @@ machinery, so uncertainty propagates end to end in either case.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -51,7 +51,9 @@ class PipelineConfig:
     posterior_draws: int = 8               # S topological posterior draws
     jitter_sigma: float = 0.30             # jitter as a fraction of median lifetime
     sigma_dyo: float | None = None         # maroulas: fixed DYO variance; None -> adaptive
-    sigma_dyo_multiplier: float = 3.0      # adaptive: multiplier x median(prior.sigmas)
+    sigma_dyo_multiplier: float | str = 3.0   # adaptive: multiplier x median(prior.sigmas),
+    #   or "eb" to select the multiplier by marked-PPP marginal likelihood
+    #   (empirical Bayes; see btate.topo_posterior.eb) — no hand tuning.
     sigma_dyo_floor: float = 1e-8
     sigma_dyo_cap: float | None = None
     posterior_alpha: float = 1.0
@@ -81,11 +83,10 @@ class PipelineConfig:
     # finite-rank FGP treats the ``resolution`` grid points per subject as
     # independent, overcounting precision by ~ resolution / (temporal dof).
     # Calibrated in Phase 4 (near-nominal coverage of the self-consistent estimand).
-    fgp_posterior_scale: float = 8.0
+    # Pass "godambe" to estimate the correction from the data instead
+    # (cluster-robust sandwich covariance; see FunctionalGPEstimator).
+    fgp_posterior_scale: float | str = 8.0
     alpha: float = 0.05
-
-    # --- Notebook ergonomics ---
-    progress: bool = False                # show tqdm progress bars if available
 
     seed: int = 20260701
 
@@ -145,11 +146,16 @@ def _jitter_draws(diagram_bd, n_draws, sigma, rng):
     return out
 
 
-def resolve_sigma_dyo(prior, cfg: PipelineConfig) -> dict:
+def resolve_sigma_dyo(prior, cfg: PipelineConfig, diagrams_bp=None,
+                      clutter=None) -> dict:
     """Resolve the Maroulas ``sigma_DYO`` value for one elicited prior.
 
     ``bayes_tda`` uses variance-like ``sigmas`` internally, so the adaptive
     default is defined in those units: ``multiplier * median(prior.sigmas)``.
+    With ``cfg.sigma_dyo_multiplier == "eb"``, the multiplier is instead
+    selected by maximizing the marked-PPP marginal likelihood of the observed
+    diagrams (empirical Bayes); this path requires ``diagrams_bp`` (observed
+    diagrams in birth--persistence coordinates) and ``clutter``.
     """
     prior_sigmas = np.asarray(prior.sigmas, dtype=float).ravel()
     valid = prior_sigmas[np.isfinite(prior_sigmas) & (prior_sigmas > 0.0)]
@@ -166,6 +172,28 @@ def resolve_sigma_dyo(prior, cfg: PipelineConfig) -> dict:
             "sigma_dyo_mode": "fixed",
             "sigma_dyo_multiplier": float("nan"),
             "prior_sigma_median": prior_sigma_median,
+        }
+
+    if isinstance(cfg.sigma_dyo_multiplier, str):
+        if cfg.sigma_dyo_multiplier != "eb":
+            raise ValueError("sigma_dyo_multiplier must be a positive float or 'eb'")
+        if diagrams_bp is None or clutter is None:
+            raise ValueError(
+                "sigma_dyo_multiplier='eb' needs diagrams_bp and clutter to "
+                "evaluate the marginal likelihood"
+            )
+        from btate.topo_posterior.eb import select_sigma_dyo
+
+        selection = select_sigma_dyo(
+            diagrams_bp, prior, clutter, alpha=cfg.posterior_alpha,
+            floor=cfg.sigma_dyo_floor, cap=cfg.sigma_dyo_cap,
+        )
+        return {
+            "sigma_dyo": selection["sigma_dyo"],
+            "sigma_dyo_mode": "empirical_bayes_marginal_likelihood",
+            "sigma_dyo_multiplier": selection["sigma_dyo_multiplier"],
+            "prior_sigma_median": selection["prior_sigma_median"],
+            "sigma_dyo_at_boundary": selection["at_boundary"],
         }
 
     multiplier = float(cfg.sigma_dyo_multiplier)
@@ -266,16 +294,6 @@ def _subject_embedding_draws(diagram_bd, prior, clutter, cfg, sample_range, seed
     return draws, summary.grid
 
 
-def _progress_iter(iterable, enabled: bool, **kwargs):
-    if not enabled:
-        return iterable
-    try:
-        from tqdm.auto import tqdm
-    except Exception:
-        return iterable
-    return tqdm(iterable, **kwargs)
-
-
 def run_bayesian_pipeline(clouds, A, X, pi_hat, cfg: PipelineConfig) -> PipelineResult:
     """Run the full Bayesian TATE pipeline on observed point clouds.
 
@@ -292,12 +310,7 @@ def run_bayesian_pipeline(clouds, A, X, pi_hat, cfg: PipelineConfig) -> Pipeline
     n = len(clouds)
     t0 = time.perf_counter()
 
-    diagrams = [
-        h1_diagram(c)
-        for c in _progress_iter(
-            clouds, cfg.progress, total=n, desc="H1 diagrams", unit="subject",
-        )
-    ]
+    diagrams = [h1_diagram(c) for c in clouds]
     sample_range = cfg.sample_range or _auto_sample_range(diagrams)
 
     prior = clutter = None
@@ -314,14 +327,17 @@ def run_bayesian_pipeline(clouds, A, X, pi_hat, cfg: PipelineConfig) -> Pipeline
                 clutter_n_components=cfg.clutter_components,
                 random_state=cfg.seed,
             )
-            sigma_info = resolve_sigma_dyo(prior, cfg)
+            sigma_info = resolve_sigma_dyo(
+                prior, cfg, diagrams_bp=train_bp, clutter=clutter,
+            )
+            # Freeze the resolved value so per-subject draws don't re-resolve
+            # (required for the "eb" path, which needs the pooled diagrams).
+            cfg = replace(cfg, sigma_dyo=sigma_info["sigma_dyo"])
     t_topo0 = time.perf_counter()
 
     per_subject = []
     grid = None
-    for i in _progress_iter(
-        range(n), cfg.progress, total=n, desc="posterior embeddings", unit="subject",
-    ):
+    for i in range(n):
         draws, grid = _subject_embedding_draws(
             diagrams[i], prior, clutter, cfg, sample_range,
             seed=cfg.seed + 1000 * i,
@@ -379,6 +395,11 @@ def run_bayesian_pipeline(clouds, A, X, pi_hat, cfg: PipelineConfig) -> Pipeline
             "prior_sigma_median": (
                 None if sigma_info is None else sigma_info["prior_sigma_median"]
             ),
+            "sigma_dyo_at_boundary": (
+                None if sigma_info is None
+                else sigma_info.get("sigma_dyo_at_boundary")
+            ),
+            "fgp_posterior_scale": cfg.fgp_posterior_scale,
             "empty_diagrams": int(sum(d.shape[0] == 0 for d in diagrams)),
         },
     )

@@ -9,6 +9,7 @@ from __future__ import annotations
 from .adapters import bd_to_bp, bp_to_bd, lifetimes
 from .sampler import PosteriorDiagramSampler
 from .elicitation import elicit_prior_clutter, sensitivity_analysis
+from .eb import select_sigma_dyo, sigma_dyo_profile_loglik
 
 __all__ = [
     "bd_to_bp",
@@ -17,4 +18,6 @@ __all__ = [
     "PosteriorDiagramSampler",
     "elicit_prior_clutter",
     "sensitivity_analysis",
+    "select_sigma_dyo",
+    "sigma_dyo_profile_loglik",
 ]

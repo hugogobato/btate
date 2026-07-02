@@ -67,6 +67,7 @@ def nested_posterior_tate(
         raise ValueError("n_causal_draws must be positive")
     rng = np.random.default_rng(random_state)
     pooled = []
+    scale_hats = []
     for draw_idx in range(arr.shape[0]):
         fit_seed = int(rng.integers(0, np.iinfo(np.int32).max))
         post_seed = int(rng.integers(0, np.iinfo(np.int32).max))
@@ -80,6 +81,9 @@ def nested_posterior_tate(
                 n_draws=n_causal_draws, alpha=alpha, random_state=post_seed
             ).draws
         )
+        hat = getattr(model, "posterior_scale_hat_", float("nan"))
+        if np.isfinite(hat):
+            scale_hats.append(float(hat))
     draws = np.vstack(pooled)
     return summarize_causal_effect(
         draws,
@@ -89,6 +93,9 @@ def nested_posterior_tate(
             "propagation": "nested",
             "n_topological_draws": int(arr.shape[0]),
             "n_causal_draws_per_topological_draw": int(n_causal_draws),
+            "posterior_scale_hat_mean": (
+                float(np.mean(scale_hats)) if scale_hats else float("nan")
+            ),
         },
     )
 

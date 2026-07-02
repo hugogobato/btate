@@ -28,8 +28,11 @@ class JointCalibrationCell:
     synth: SyntheticConfig
     pipeline: PipelineConfig
     n_reps: int = 8
-    sigma_multipliers: tuple[float, ...] = (0.5, 1.0, 2.0, 3.0)
-    fgp_scales: tuple[float, ...] = (8.0, 16.0, 32.0, 64.0)
+    # Entries may be floats or the adaptive sentinels: "eb" for the
+    # marginal-likelihood sigma_dyo multiplier, "godambe" for the estimated
+    # FGP posterior scale.
+    sigma_multipliers: tuple[float | str, ...] = (0.5, 1.0, 2.0, 3.0)
+    fgp_scales: tuple[float | str, ...] = (8.0, 16.0, 32.0, 64.0)
     mc_realizations: int = 20
 
 
@@ -132,14 +135,20 @@ def _run_joint_rep(cell: JointCalibrationCell, rep: int) -> list[dict]:
     pi = np.clip(dataset.pi, base_pipe.propensity_clip, 1.0 - base_pipe.propensity_clip)[:, None]
     observed_effect = np.mean((a / pi - (1.0 - a) / (1.0 - pi)) * observed_curves, axis=0)
 
+    train_bp = [bd_to_bp(d) for d in diagrams if d.shape[0] > 0]
     rows = []
     for sigma_mult in cell.sigma_multipliers:
         pipe_sigma = replace(
             base_pipe,
             sigma_dyo=None,
-            sigma_dyo_multiplier=float(sigma_mult),
+            sigma_dyo_multiplier=(
+                sigma_mult if isinstance(sigma_mult, str) else float(sigma_mult)
+            ),
         )
-        sigma_info = resolve_sigma_dyo(prior, pipe_sigma)
+        sigma_info = resolve_sigma_dyo(
+            prior, pipe_sigma, diagrams_bp=train_bp, clutter=clutter,
+        )
+        pipe_sigma = replace(pipe_sigma, sigma_dyo=sigma_info["sigma_dyo"])
         phi_draws, grid = _embedding_draws_for_sigma(
             diagrams, prior, clutter, pipe_sigma, sample_range,
         )
@@ -157,7 +166,9 @@ def _run_joint_rep(cell: JointCalibrationCell, rep: int) -> list[dict]:
                 length_scale_t=pipe_sigma.length_scale_t,
                 noise_variance=pipe_sigma.noise_variance,
                 propensity_clip=pipe_sigma.propensity_clip,
-                posterior_scale=float(fgp_scale),
+                posterior_scale=(
+                    fgp_scale if isinstance(fgp_scale, str) else float(fgp_scale)
+                ),
             )
             comparison = compare_propagation(
                 phi_draws,
@@ -180,10 +191,16 @@ def _run_joint_rep(cell: JointCalibrationCell, rep: int) -> list[dict]:
                 "noise_level": float(synth.noise_level),
                 "effect_size": float(synth.effect_size),
                 "overlap_strength": float(synth.overlap_strength),
-                "sigma_dyo_multiplier": float(sigma_mult),
+                "sigma_setting": str(sigma_mult),
+                "sigma_dyo_multiplier": float(sigma_info["sigma_dyo_multiplier"]),
                 "sigma_dyo": float(sigma_info["sigma_dyo"]),
                 "prior_sigma_median": float(sigma_info["prior_sigma_median"]),
-                "fgp_posterior_scale": float(fgp_scale),
+                "fgp_posterior_scale": (
+                    fgp_scale if isinstance(fgp_scale, str) else float(fgp_scale)
+                ),
+                "fgp_posterior_scale_hat": float(
+                    effect.metadata.get("posterior_scale_hat_mean", float("nan"))
+                ),
                 "topo_l2_attenuation_ratio": topo_ratio,
                 "topo_rmse_to_observed_effect": rmse(topo_effect, observed_effect),
                 "width_ratio_nested_plugin": float(comparison.width_ratio),
@@ -204,7 +221,7 @@ _ID_KEYS = (
     "noise_level",
     "effect_size",
     "overlap_strength",
-    "sigma_dyo_multiplier",
+    "sigma_setting",
     "fgp_posterior_scale",
 )
 
@@ -217,7 +234,10 @@ def aggregate_joint_records(records: list[dict]) -> list[dict]:
         groups.setdefault(key, []).append(rec)
 
     out = []
-    for key, vals in sorted(groups.items()):
+    # Keys may mix floats and adaptive sentinels (e.g. 16.0 vs "godambe");
+    # sort on the string form so mixed grids aggregate cleanly.
+    for key, vals in sorted(groups.items(),
+                            key=lambda kv: tuple(str(k) for k in kv[0])):
         first = vals[0]
         row = {k: first[k] for k in _ID_KEYS}
         row["n_reps"] = len(vals)

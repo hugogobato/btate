@@ -81,6 +81,9 @@ class PipelineConfig:
     fgp_posterior_scale: float = 8.0
     alpha: float = 0.05
 
+    # --- Notebook ergonomics ---
+    progress: bool = False                # show tqdm progress bars if available
+
     seed: int = 20260701
 
 
@@ -214,6 +217,16 @@ def _subject_embedding_draws(diagram_bd, prior, clutter, cfg, sample_range, seed
     return draws, summary.grid
 
 
+def _progress_iter(iterable, enabled: bool, **kwargs):
+    if not enabled:
+        return iterable
+    try:
+        from tqdm.auto import tqdm
+    except Exception:
+        return iterable
+    return tqdm(iterable, **kwargs)
+
+
 def run_bayesian_pipeline(clouds, A, X, pi_hat, cfg: PipelineConfig) -> PipelineResult:
     """Run the full Bayesian TATE pipeline on observed point clouds.
 
@@ -230,7 +243,12 @@ def run_bayesian_pipeline(clouds, A, X, pi_hat, cfg: PipelineConfig) -> Pipeline
     n = len(clouds)
     t0 = time.perf_counter()
 
-    diagrams = [h1_diagram(c) for c in clouds]
+    diagrams = [
+        h1_diagram(c)
+        for c in _progress_iter(
+            clouds, cfg.progress, total=n, desc="H1 diagrams", unit="subject",
+        )
+    ]
     sample_range = cfg.sample_range or _auto_sample_range(diagrams)
 
     prior = clutter = None
@@ -250,7 +268,9 @@ def run_bayesian_pipeline(clouds, A, X, pi_hat, cfg: PipelineConfig) -> Pipeline
 
     per_subject = []
     grid = None
-    for i in range(n):
+    for i in _progress_iter(
+        range(n), cfg.progress, total=n, desc="posterior embeddings", unit="subject",
+    ):
         draws, grid = _subject_embedding_draws(
             diagrams[i], prior, clutter, cfg, sample_range,
             seed=cfg.seed + 1000 * i,

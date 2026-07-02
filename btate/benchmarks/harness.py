@@ -12,6 +12,7 @@ full Colab runs.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 
 import numpy as np
@@ -30,6 +31,44 @@ from .pipeline import PipelineConfig, run_bayesian_pipeline, silhouette_embeddin
 from .synthetic import (
     SyntheticConfig, generate_synthetic_dataset, montecarlo_reference, reference_effect,
 )
+
+
+def _progress_iter(iterable, enabled: bool, **kwargs):
+    if not enabled:
+        return iterable
+    try:
+        from tqdm.auto import tqdm
+    except Exception:
+        return iterable
+    return tqdm(iterable, **kwargs)
+
+
+@contextmanager
+def _joblib_progress(enabled: bool, total: int, **kwargs):
+    if not enabled:
+        yield
+        return
+    try:
+        from joblib import parallel
+        from tqdm.auto import tqdm
+    except Exception:
+        yield
+        return
+
+    bar = tqdm(total=total, **kwargs)
+    old_callback = parallel.BatchCompletionCallBack
+
+    class _TqdmBatchCompletionCallback(old_callback):
+        def __call__(self, *args, **kw):
+            bar.update(n=self.batch_size)
+            return super().__call__(*args, **kw)
+
+    parallel.BatchCompletionCallBack = _TqdmBatchCompletionCallback
+    try:
+        yield
+    finally:
+        parallel.BatchCompletionCallBack = old_callback
+        bar.close()
 
 
 @dataclass
@@ -181,7 +220,8 @@ def _evaluate_cell_rep(cell: SweepCell, rep: int) -> dict:
     return rec
 
 
-def run_cell(cell: SweepCell, verbose: bool = False, n_jobs: int = 1) -> dict:
+def run_cell(cell: SweepCell, verbose: bool = False, n_jobs: int = 1,
+             progress: bool = False) -> dict:
     """Run all repetitions of a cell and aggregate the per-run metrics.
 
     ``n_jobs`` parallelizes the repetitions across processes (respect available
@@ -189,7 +229,11 @@ def run_cell(cell: SweepCell, verbose: bool = False, n_jobs: int = 1) -> dict:
     """
     if n_jobs == 1:
         records = []
-        for rep in range(cell.n_reps):
+        reps = _progress_iter(
+            range(cell.n_reps), progress, total=cell.n_reps,
+            desc=cell.name, unit="rep",
+        )
+        for rep in reps:
             rec = _evaluate_cell_rep(cell, rep)
             records.append(rec)
             if verbose:
@@ -198,9 +242,12 @@ def run_cell(cell: SweepCell, verbose: bool = False, n_jobs: int = 1) -> dict:
                       f"reject={rec['bayes_reject']} t={rec['total_s']:.1f}s")
     else:
         from joblib import Parallel, delayed
-        records = Parallel(n_jobs=n_jobs, backend="loky")(
-            delayed(_evaluate_cell_rep)(cell, rep) for rep in range(cell.n_reps)
-        )
+        with _joblib_progress(
+            progress, total=cell.n_reps, desc=cell.name, unit="rep",
+        ):
+            records = Parallel(n_jobs=n_jobs, backend="loky")(
+                delayed(_evaluate_cell_rep)(cell, rep) for rep in range(cell.n_reps)
+            )
     return aggregate_cell(cell.name, records)
 
 
@@ -240,7 +287,7 @@ def aggregate_cell(name: str, records: list[dict]) -> dict:
 
 
 def run_sweep(cells: list[SweepCell], verbose: bool = False,
-              n_jobs: int = 1) -> list[dict]:
+              n_jobs: int = 1, progress: bool = False) -> list[dict]:
     """Run a list of cells and return their aggregated summaries.
 
     With ``n_jobs != 1`` every ``(cell, rep)`` task is flattened and dispatched
@@ -249,19 +296,24 @@ def run_sweep(cells: list[SweepCell], verbose: bool = False,
     """
     if n_jobs == 1:
         out = []
-        for cell in cells:
+        for cell in _progress_iter(
+            cells, progress, total=len(cells), desc="sweep cells", unit="cell",
+        ):
             if verbose:
                 print(f"[cell] {cell.name} ({cell.n_reps} reps)")
-            out.append(run_cell(cell, verbose=verbose))
+            out.append(run_cell(cell, verbose=verbose, progress=progress))
         return out
 
     from joblib import Parallel, delayed
     tasks = [(ci, rep) for ci, c in enumerate(cells) for rep in range(c.n_reps)]
     if verbose:
         print(f"[sweep] {len(cells)} cells, {len(tasks)} runs, n_jobs={n_jobs}")
-    results = Parallel(n_jobs=n_jobs, backend="loky", verbose=5 if verbose else 0)(
-        delayed(_evaluate_cell_rep)(cells[ci], rep) for ci, rep in tasks
-    )
+    with _joblib_progress(
+        progress, total=len(tasks), desc="sweep runs", unit="run",
+    ):
+        results = Parallel(n_jobs=n_jobs, backend="loky", verbose=5 if verbose else 0)(
+            delayed(_evaluate_cell_rep)(cells[ci], rep) for ci, rep in tasks
+        )
     grouped: dict[int, list] = {}
     for (ci, _rep), rec in zip(tasks, results):
         grouped.setdefault(ci, []).append(rec)

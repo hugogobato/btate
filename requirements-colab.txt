@@ -10,3 +10,4 @@ pandas>=2.0
 matplotlib>=3.6
 networkx>=3.0
 nilearn>=0.10
+tqdm>=4.66

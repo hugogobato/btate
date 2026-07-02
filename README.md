@@ -86,8 +86,7 @@ pytest -q
 
 ## Citation
 
-If you use `btate`, please cite Kim & Lee (2026, TATE), Maroulas et al. (2020),
-Martínez (2024), and Bubenik (2015), together with this package.
+If you use `btate`, please cite this package.
 
 ## License
 

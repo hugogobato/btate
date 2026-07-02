@@ -50,7 +50,10 @@ class PipelineConfig:
     topo_method: str = "jitter"            # "jitter" | "maroulas"
     posterior_draws: int = 8               # S topological posterior draws
     jitter_sigma: float = 0.30             # jitter as a fraction of median lifetime
-    sigma_dyo: float = 0.03                # maroulas: DYO kernel sd
+    sigma_dyo: float | None = None         # maroulas: fixed DYO variance; None -> adaptive
+    sigma_dyo_multiplier: float = 3.0      # adaptive: multiplier x median(prior.sigmas)
+    sigma_dyo_floor: float = 1e-8
+    sigma_dyo_cap: float | None = None
     posterior_alpha: float = 1.0
     prior_components: int = 8
     clutter_components: int = 2
@@ -142,6 +145,51 @@ def _jitter_draws(diagram_bd, n_draws, sigma, rng):
     return out
 
 
+def resolve_sigma_dyo(prior, cfg: PipelineConfig) -> dict:
+    """Resolve the Maroulas ``sigma_DYO`` value for one elicited prior.
+
+    ``bayes_tda`` uses variance-like ``sigmas`` internally, so the adaptive
+    default is defined in those units: ``multiplier * median(prior.sigmas)``.
+    """
+    prior_sigmas = np.asarray(prior.sigmas, dtype=float).ravel()
+    valid = prior_sigmas[np.isfinite(prior_sigmas) & (prior_sigmas > 0.0)]
+    if valid.size == 0:
+        raise ValueError("cannot adapt sigma_dyo: prior.sigmas has no positive finite values")
+    prior_sigma_median = float(np.median(valid))
+
+    if cfg.sigma_dyo is not None:
+        sigma = float(cfg.sigma_dyo)
+        if sigma <= 0.0 or not np.isfinite(sigma):
+            raise ValueError("sigma_dyo must be positive and finite")
+        return {
+            "sigma_dyo": sigma,
+            "sigma_dyo_mode": "fixed",
+            "sigma_dyo_multiplier": float("nan"),
+            "prior_sigma_median": prior_sigma_median,
+        }
+
+    multiplier = float(cfg.sigma_dyo_multiplier)
+    floor = float(cfg.sigma_dyo_floor)
+    if multiplier <= 0.0 or not np.isfinite(multiplier):
+        raise ValueError("sigma_dyo_multiplier must be positive and finite")
+    if floor <= 0.0 or not np.isfinite(floor):
+        raise ValueError("sigma_dyo_floor must be positive and finite")
+
+    sigma = max(multiplier * prior_sigma_median, floor)
+    if cfg.sigma_dyo_cap is not None:
+        cap = float(cfg.sigma_dyo_cap)
+        if cap <= 0.0 or not np.isfinite(cap):
+            raise ValueError("sigma_dyo_cap must be positive and finite")
+        sigma = min(sigma, cap)
+
+    return {
+        "sigma_dyo": float(sigma),
+        "sigma_dyo_mode": "adaptive_median_prior_sigma",
+        "sigma_dyo_multiplier": multiplier,
+        "prior_sigma_median": prior_sigma_median,
+    }
+
+
 def _maroulas_draws(diagram_bd, prior, clutter, cfg, rng_seed):
     from bayes_tda.intensities import Posterior
 
@@ -150,9 +198,10 @@ def _maroulas_draws(diagram_bd, prior, clutter, cfg, rng_seed):
     if diagram_bd.shape[0] == 0:
         return [np.empty((0, 2), dtype=float) for _ in range(cfg.posterior_draws)]
     diagram_bp = bd_to_bp(diagram_bd)
+    sigma_info = resolve_sigma_dyo(prior, cfg)
     posterior = Posterior(
         DYO=[diagram_bp], prior=prior, clutter=clutter,
-        sigma_DYO=cfg.sigma_dyo, alpha=cfg.posterior_alpha, min_birth=0.0,
+        sigma_DYO=sigma_info["sigma_dyo"], alpha=cfg.posterior_alpha, min_birth=0.0,
     )
     sampler = PosteriorDiagramSampler(posterior)
     cardinality = max(1, int(diagram_bd.shape[0]))
@@ -252,6 +301,7 @@ def run_bayesian_pipeline(clouds, A, X, pi_hat, cfg: PipelineConfig) -> Pipeline
     sample_range = cfg.sample_range or _auto_sample_range(diagrams)
 
     prior = clutter = None
+    sigma_info = None
     if cfg.topo_method == "maroulas":
         from btate.topo_posterior.elicitation import elicit_prior_clutter
 
@@ -264,6 +314,7 @@ def run_bayesian_pipeline(clouds, A, X, pi_hat, cfg: PipelineConfig) -> Pipeline
                 clutter_n_components=cfg.clutter_components,
                 random_state=cfg.seed,
             )
+            sigma_info = resolve_sigma_dyo(prior, cfg)
     t_topo0 = time.perf_counter()
 
     per_subject = []
@@ -320,6 +371,14 @@ def run_bayesian_pipeline(clouds, A, X, pi_hat, cfg: PipelineConfig) -> Pipeline
             "topo_method": cfg.topo_method, "embedding": cfg.embedding,
             "weights": cfg.weights, "propagation": cfg.propagation,
             "posterior_draws": int(cfg.posterior_draws),
+            "sigma_dyo": None if sigma_info is None else sigma_info["sigma_dyo"],
+            "sigma_dyo_mode": None if sigma_info is None else sigma_info["sigma_dyo_mode"],
+            "sigma_dyo_multiplier": (
+                None if sigma_info is None else sigma_info["sigma_dyo_multiplier"]
+            ),
+            "prior_sigma_median": (
+                None if sigma_info is None else sigma_info["prior_sigma_median"]
+            ),
             "empty_diagrams": int(sum(d.shape[0] == 0 for d in diagrams)),
         },
     )

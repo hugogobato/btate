@@ -58,6 +58,9 @@ def __getattr__(name):  # PEP 562 lazy access to the heavier submodules
         "evaluate_run": "harness", "sweep_to_rows": "harness",
         "aipw_effect": "frequentist", "FrequentistEffect": "frequentist",
         "full_ablation_grid": "ablation",
+        "pre_fgp_maroulas_diagnostic": "maroulas_diagnostics",
+        "maroulas_sigma_sensitivity": "maroulas_diagnostics",
+        "strip_diagnostic_arrays": "maroulas_diagnostics",
     }
     if name in submodules:
         mod = importlib.import_module(f"{__name__}.{submodules[name]}")

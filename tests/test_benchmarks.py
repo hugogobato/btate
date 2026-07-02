@@ -17,9 +17,15 @@ from btate.benchmarks.synthetic import (
 from btate.benchmarks.frequentist import aipw_effect, function_on_scalar_ridge
 from btate.benchmarks.pipeline import (
     PipelineConfig, run_bayesian_pipeline, silhouette_embedding_fn, h1_diagram,
+    resolve_sigma_dyo,
 )
 from btate.benchmarks.harness import SweepCell, evaluate_run, run_cell, sweep_to_rows
 from btate.benchmarks.ablation import full_ablation_grid, weighting_ablation
+from btate.benchmarks.maroulas_diagnostics import (
+    maroulas_sigma_sensitivity,
+    pre_fgp_maroulas_diagnostic,
+    strip_diagnostic_arrays,
+)
 
 
 def _fast_pipe(**kw) -> PipelineConfig:
@@ -116,6 +122,72 @@ def test_run_bayesian_pipeline_end_to_end():
     assert res.phi_draws.shape[1] == 10
     assert res.nested.draws.shape[1] == res.grid.shape[0]
     assert res.timing["total_s"] >= 0.0
+
+
+def test_adaptive_sigma_dyo_uses_prior_variance_scale():
+    pytest.importorskip("bayes_tda")
+    from bayes_tda.intensities import RGaussianMixture
+
+    prior = RGaussianMixture(
+        mus=np.array([[0.1, 0.2], [0.2, 0.3]]),
+        sigmas=np.array([1e-4, 2e-4]),
+        weights=np.array([1.0, 1.0]),
+        normalize_weights=False,
+    )
+    info = resolve_sigma_dyo(
+        prior,
+        PipelineConfig(sigma_dyo=None, sigma_dyo_multiplier=3.0),
+    )
+    assert info["sigma_dyo_mode"] == "adaptive_median_prior_sigma"
+    assert info["sigma_dyo"] == pytest.approx(4.5e-4)
+
+    fixed = resolve_sigma_dyo(prior, PipelineConfig(sigma_dyo=0.01))
+    assert fixed["sigma_dyo_mode"] == "fixed"
+    assert fixed["sigma_dyo"] == pytest.approx(0.01)
+
+
+def test_pre_fgp_maroulas_diagnostic_runs_tiny():
+    pytest.importorskip("bayes_tda")
+    synth = SyntheticConfig(n=6, num_pts=45, effect_size=0.10, noise_level=0.8, seed=10)
+    pipe = _fast_pipe(
+        topo_method="maroulas",
+        weights="power",
+        posterior_draws=2,
+        resolution=16,
+        sigma_dyo=None,
+        sigma_dyo_multiplier=3.0,
+    )
+    row = pre_fgp_maroulas_diagnostic(synth, pipe, sigma_multiplier=3.0)
+    for key in (
+        "observed_effect_l2",
+        "maroulas_effect_l2",
+        "l2_attenuation_ratio",
+        "rmse_to_observed_effect",
+        "sigma_dyo_median",
+        "flag_attenuated",
+    ):
+        assert key in row
+    assert row["_grid"].shape == row["_observed_effect"].shape
+    assert np.isfinite(row["sigma_dyo_median"])
+
+
+def test_maroulas_sigma_sensitivity_strips_arrays():
+    pytest.importorskip("bayes_tda")
+    synth = SyntheticConfig(n=6, num_pts=45, effect_size=0.10, noise_level=0.8, seed=11)
+    pipe = _fast_pipe(
+        topo_method="maroulas",
+        weights="power",
+        posterior_draws=1,
+        resolution=12,
+        sigma_dyo=None,
+    )
+    rows = maroulas_sigma_sensitivity(
+        synth, pipe, sigma_multipliers=(1.0, 3.0), prior_variants=("pooled",),
+    )
+    compact = strip_diagnostic_arrays(rows)
+    assert len(compact) == 2
+    assert all("sigma_setting" in row for row in compact)
+    assert all(not any(k.startswith("_") for k in row) for row in compact)
 
 
 def test_plugin_only_propagation():

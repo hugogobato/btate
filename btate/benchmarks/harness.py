@@ -12,6 +12,7 @@ full Colab runs.
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field, replace
 
 import numpy as np
@@ -53,6 +54,14 @@ class SweepCell:
     mc_realizations: int = 40
     freq_methods: tuple = ("multiplier_bootstrap", "liebl_reimherr", "pini_vantini")
     freq_liebl_backend: str = "python"
+    # Functional-BCF alternative (Task 3.2): fit tsbcf on the same posterior
+    # embeddings (plug-in propagation) and report ``bcf_*`` metrics.  Requires
+    # Rscript + the vendored tsbcf-master package; MCMC makes it much slower
+    # than the FGP, so it is opt-in.  ``tsbcf_kwargs`` are forwarded to
+    # :func:`btate.causal.fit_tsbcf_tate` (e.g. package_dir, nburn, nsim,
+    # nested_draws).
+    run_tsbcf: bool = False
+    tsbcf_kwargs: dict = field(default_factory=dict)
 
 
 def _reference(dataset, pipe: PipelineConfig, sample_range):
@@ -94,7 +103,9 @@ def evaluate_run(synth: SyntheticConfig, pipe: PipelineConfig,
                  coverage_reference: str = "clean",
                  mc_realizations: int = 40,
                  freq_methods=("multiplier_bootstrap", "liebl_reimherr", "pini_vantini"),
-                 freq_liebl_backend: str = "python") -> dict:
+                 freq_liebl_backend: str = "python",
+                 run_tsbcf: bool = False,
+                 tsbcf_kwargs: dict | None = None) -> dict:
     """Run one dataset end-to-end and return per-run metrics.
 
     Bias / RMSE are computed against the clean injected-loop truth; coverage and
@@ -172,6 +183,27 @@ def evaluate_run(synth: SyntheticConfig, pipe: PipelineConfig,
                 b.lower, b.upper, cov_ref)
             record[f"freq_{m}_width"] = interval_width(b.lower, b.upper, grid)
             record[f"freq_{m}_reject"] = _band_rejects(b.lower, b.upper)
+
+    if run_tsbcf:
+        from btate.causal import fit_tsbcf_tate
+
+        t0 = time.perf_counter()
+        bcf = fit_tsbcf_tate(
+            result.phi_draws, dataset.A, dataset.X, grid, pi_hat=dataset.pi,
+            alpha=pipe.alpha, **dict(tsbcf_kwargs or {}),
+        )
+        record["bcf_s"] = time.perf_counter() - t0
+        record["bcf_rmse"] = rmse(bcf.mean, reference)
+        record["bcf_bias"] = bias(bcf.mean, reference)
+        record["bcf_cov_pointwise"] = pointwise_coverage(
+            bcf.pointwise_lower, bcf.pointwise_upper, cov_ref)
+        record["bcf_cov_simultaneous"] = simultaneous_coverage(
+            bcf.simultaneous_lower, bcf.simultaneous_upper, cov_ref)
+        record["bcf_width"] = interval_width(
+            bcf.simultaneous_lower, bcf.simultaneous_upper, grid)
+        record["bcf_reject"] = _band_rejects(
+            bcf.simultaneous_lower, bcf.simultaneous_upper)
+        record["bcf_pr_excludes_zero"] = float(bcf.pr_excludes_zero)
     return record
 
 
@@ -185,6 +217,8 @@ def _evaluate_cell_rep(cell: SweepCell, rep: int) -> dict:
         mc_realizations=cell.mc_realizations,
         freq_methods=cell.freq_methods,
         freq_liebl_backend=cell.freq_liebl_backend,
+        run_tsbcf=cell.run_tsbcf,
+        tsbcf_kwargs=cell.tsbcf_kwargs,
     )
     rec["rep"] = rep
     return rec
@@ -249,17 +283,18 @@ def aggregate_cell(name: str, records: list[dict]) -> dict:
 
 
 def run_sweep(cells: list[SweepCell], verbose: bool = False,
-              n_jobs: int = 1) -> list[dict]:
+              n_jobs: int = 1, progress: bool = False) -> list[dict]:
     """Run a list of cells and return their aggregated summaries.
 
     With ``n_jobs != 1`` every ``(cell, rep)`` task is flattened and dispatched
     across ``n_jobs`` processes for maximum core utilization, then regrouped and
     aggregated per cell.  Keep ``n_jobs`` <= physical cores and mind RAM.
+    ``progress`` prints per-task completion (joblib) without full verbosity.
     """
     if n_jobs == 1:
         out = []
         for cell in cells:
-            if verbose:
+            if verbose or progress:
                 print(f"[cell] {cell.name} ({cell.n_reps} reps)")
             out.append(run_cell(cell, verbose=verbose))
         return out
@@ -268,7 +303,8 @@ def run_sweep(cells: list[SweepCell], verbose: bool = False,
     tasks = [(ci, rep) for ci, c in enumerate(cells) for rep in range(c.n_reps)]
     if verbose:
         print(f"[sweep] {len(cells)} cells, {len(tasks)} runs, n_jobs={n_jobs}")
-    results = Parallel(n_jobs=n_jobs, backend="loky", verbose=5 if verbose else 0)(
+    results = Parallel(n_jobs=n_jobs, backend="loky",
+                       verbose=5 if (verbose or progress) else 0)(
         delayed(_evaluate_cell_rep)(cells[ci], rep) for ci, rep in tasks
     )
     grouped: dict[int, list] = {}

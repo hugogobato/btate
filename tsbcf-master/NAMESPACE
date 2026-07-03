@@ -1,0 +1,5 @@
+useDynLib(tsbcf)
+import(Rcpp)
+exportPattern("^[[:alpha:]]+")
+importFrom("stats", "filter", "lm", "loess", "pnorm", "qchisq",
+               "qnorm", "quantile", "sd", "sigma")

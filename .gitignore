@@ -10,3 +10,4 @@ dist/
 !tests/**/*.npz
 .venv/
 env/
+.tsbcf-lib/

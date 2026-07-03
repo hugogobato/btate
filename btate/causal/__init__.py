@@ -18,7 +18,7 @@ from .propagation import (
     nested_posterior_tate,
     plugin_posterior_tate,
 )
-from .tsbcf import TSBCFAdapter, TSBCFLongData, make_tsbcf_long_data
+from .tsbcf import TSBCFAdapter, TSBCFLongData, fit_tsbcf_tate, make_tsbcf_long_data
 
 __all__ = [
     "CausalEffectPosterior",
@@ -31,5 +31,6 @@ __all__ = [
     "compare_propagation",
     "TSBCFAdapter",
     "TSBCFLongData",
+    "fit_tsbcf_tate",
     "make_tsbcf_long_data",
 ]

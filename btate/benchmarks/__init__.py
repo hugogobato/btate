@@ -53,6 +53,12 @@ def __getattr__(name):  # PEP 562 lazy access to the heavier submodules
     submodules = {
         "SyntheticConfig": "synthetic", "SyntheticDataset": "synthetic",
         "generate_synthetic_dataset": "synthetic", "reference_effect": "synthetic",
+        "montecarlo_reference": "synthetic", "standard_config": "synthetic",
+        "low_snr_config": "synthetic",
+        "clopper_pearson": "metrics",
+        "DecisionCell": "decision", "FGPVariant": "decision",
+        "run_decision_cell": "decision", "run_decision_grid": "decision",
+        "aggregate_decision": "decision", "evaluate_decision_rep": "decision",
         "PipelineConfig": "pipeline", "run_bayesian_pipeline": "pipeline",
         "SweepCell": "harness", "run_sweep": "harness", "run_cell": "harness",
         "evaluate_run": "harness", "sweep_to_rows": "harness",

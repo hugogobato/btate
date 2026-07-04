@@ -37,12 +37,17 @@ from .synthetic import (
 class SweepCell:
     """One evaluation cell: a DGP configuration + pipeline configuration.
 
-    ``coverage_reference`` selects the estimand that credible-band coverage is
-    measured against: ``"clean"`` (the injected-loop truth; fast) or
-    ``"montecarlo"`` (the self-consistent estimand the estimator is unbiased
-    for; averages ``mc_realizations`` noisy realizations — slower but the correct
-    target for a calibration study).  Bias / RMSE are always reported against the
-    clean injected truth.
+    ``coverage_reference`` selects the *primary* estimand that credible-band
+    coverage is measured against: ``"clean"``/``"denoised"`` (the injected-loop
+    truth the denoising method actually targets; fast) or ``"montecarlo"`` (the
+    self-consistent raw-silhouette estimand ``psi*`` the frequentist AIPW is
+    unbiased for by construction; averages ``mc_realizations`` noisy realizations
+    — slower).  Bias / RMSE are always reported against the clean injected truth.
+
+    With ``dual_reference=True`` (Task 4.5.1) both estimands are scored in a
+    single run and reported side by side via ``*_clean`` / ``*_mc`` suffixed
+    columns, so a coverage claim is never silently a test of "how well does the
+    Bayesian pipeline reproduce the frequentist's own estimator".
     """
 
     name: str
@@ -51,6 +56,7 @@ class SweepCell:
     n_reps: int = 5
     run_frequentist: bool = True
     coverage_reference: str = "clean"
+    dual_reference: bool = False
     mc_realizations: int = 40
     freq_methods: tuple = ("multiplier_bootstrap", "liebl_reimherr", "pini_vantini")
     freq_liebl_backend: str = "python"
@@ -98,9 +104,23 @@ def _observed_fixed_silhouette(clouds, pipe: PipelineConfig, sample_range):
     return np.stack(curves)
 
 
+_CLEAN_REFS = ("clean", "denoised")
+
+
+def _cov_columns(effect, cov_ref, grid, prefix: str, suffix: str) -> dict:
+    """Coverage / width columns for one effect posterior against one reference."""
+    return {
+        f"{prefix}_cov_pointwise{suffix}": pointwise_coverage(
+            effect.pointwise_lower, effect.pointwise_upper, cov_ref),
+        f"{prefix}_cov_simultaneous{suffix}": simultaneous_coverage(
+            effect.simultaneous_lower, effect.simultaneous_upper, cov_ref),
+    }
+
+
 def evaluate_run(synth: SyntheticConfig, pipe: PipelineConfig,
                  run_frequentist: bool = True,
                  coverage_reference: str = "clean",
+                 dual_reference: bool = False,
                  mc_realizations: int = 40,
                  freq_methods=("multiplier_bootstrap", "liebl_reimherr", "pini_vantini"),
                  freq_liebl_backend: str = "python",
@@ -108,9 +128,11 @@ def evaluate_run(synth: SyntheticConfig, pipe: PipelineConfig,
                  tsbcf_kwargs: dict | None = None) -> dict:
     """Run one dataset end-to-end and return per-run metrics.
 
-    Bias / RMSE are computed against the clean injected-loop truth; coverage and
-    interval width are computed against ``coverage_reference`` (``"clean"`` or
-    the self-consistent ``"montecarlo"`` estimand).
+    Bias / RMSE are computed against the clean injected-loop truth; the *primary*
+    coverage and interval width are computed against ``coverage_reference``
+    (``"clean"``/``"denoised"`` — the injected truth — or the self-consistent
+    raw-silhouette ``"montecarlo"`` estimand ``psi*``).  With ``dual_reference``,
+    both estimands are also scored under ``*_clean`` / ``*_mc`` columns.
     """
     dataset = generate_synthetic_dataset(synth)
     result = run_bayesian_pipeline(
@@ -119,13 +141,14 @@ def evaluate_run(synth: SyntheticConfig, pipe: PipelineConfig,
     grid = result.grid
     sample_range = tuple(result.meta["sample_range"])
     reference = _reference(dataset, pipe, sample_range)      # clean truth (bias/RMSE)
-    if coverage_reference == "montecarlo":
-        cov_ref = montecarlo_reference(
+    need_mc = (coverage_reference == "montecarlo") or dual_reference
+    ref_mc = (
+        montecarlo_reference(
             synth, silhouette_embedding_fn(pipe, sample_range),
-            n_realizations=mc_realizations,
-        )
-    else:
-        cov_ref = reference
+            n_realizations=mc_realizations)
+        if need_mc else None
+    )
+    cov_ref = ref_mc if coverage_reference == "montecarlo" else reference
 
     effect = result.nested if result.nested is not None else result.plugin
     is_null = synth.effect_size == 0.0 and synth.effect_covariate_gain == 0.0
@@ -168,6 +191,9 @@ def evaluate_run(synth: SyntheticConfig, pipe: PipelineConfig,
         record["width_ratio_nested_plugin"] = result.comparison.width_ratio
         record["bayes_width_plugin"] = interval_width(
             result.plugin.simultaneous_lower, result.plugin.simultaneous_upper, grid)
+    if dual_reference:
+        record.update(_cov_columns(effect, reference, grid, "bayes", "_clean"))
+        record.update(_cov_columns(effect, ref_mc, grid, "bayes", "_mc"))
 
     if run_frequentist:
         phi_obs = _observed_fixed_silhouette(dataset.observed_clouds(), pipe, sample_range)
@@ -183,6 +209,11 @@ def evaluate_run(synth: SyntheticConfig, pipe: PipelineConfig,
                 b.lower, b.upper, cov_ref)
             record[f"freq_{m}_width"] = interval_width(b.lower, b.upper, grid)
             record[f"freq_{m}_reject"] = _band_rejects(b.lower, b.upper)
+            if dual_reference:
+                record[f"freq_{m}_cov_simultaneous_clean"] = simultaneous_coverage(
+                    b.lower, b.upper, reference)
+                record[f"freq_{m}_cov_simultaneous_mc"] = simultaneous_coverage(
+                    b.lower, b.upper, ref_mc)
 
     if run_tsbcf:
         from btate.causal import fit_tsbcf_tate
@@ -204,6 +235,9 @@ def evaluate_run(synth: SyntheticConfig, pipe: PipelineConfig,
         record["bcf_reject"] = _band_rejects(
             bcf.simultaneous_lower, bcf.simultaneous_upper)
         record["bcf_pr_excludes_zero"] = float(bcf.pr_excludes_zero)
+        if dual_reference:
+            record.update(_cov_columns(bcf, reference, grid, "bcf", "_clean"))
+            record.update(_cov_columns(bcf, ref_mc, grid, "bcf", "_mc"))
     return record
 
 
@@ -214,6 +248,7 @@ def _evaluate_cell_rep(cell: SweepCell, rep: int) -> dict:
     rec = evaluate_run(
         synth, pipe, run_frequentist=cell.run_frequentist,
         coverage_reference=cell.coverage_reference,
+        dual_reference=cell.dual_reference,
         mc_realizations=cell.mc_realizations,
         freq_methods=cell.freq_methods,
         freq_liebl_backend=cell.freq_liebl_backend,

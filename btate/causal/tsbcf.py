@@ -252,6 +252,8 @@ write.table(fit$sigma, "{sigma_csv}", sep = ",", row.names = FALSE, col.names = 
                 check=False,
                 capture_output=True,
                 text=True,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
             )
         finally:
             if tmp is not None:
@@ -291,6 +293,7 @@ write.table(fit$sigma, "{sigma_csv}", sep = ",", row.names = FALSE, col.names = 
             proc = subprocess.run(
                 [self.rscript, str(script_path)],
                 cwd=root, check=False, capture_output=True, text=True,
+                stdin=subprocess.DEVNULL, start_new_session=True,
             )
             psi_path = root / "tsbcf_psi_draws.csv"
             if proc.returncode != 0 or not psi_path.exists():

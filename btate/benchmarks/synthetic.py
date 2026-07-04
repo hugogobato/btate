@@ -42,7 +42,26 @@ import numpy as np
 
 @dataclass
 class SyntheticConfig:
-    """Configuration for the loop-injection DGP."""
+    """Configuration for the loop-injection DGP.
+
+    Two clutter regimes (``clutter_mode``) trade off how much *denoising* the
+    problem actually needs:
+
+    * ``"annulus"`` (default, the standard Phase-4 DGP) — peripheral clutter in
+      an outer annulus creates only *short-lived* spurious H1 features that leave
+      the signal loop's death time (hence the treatment effect) intact.  The raw
+      fixed-``r`` silhouette is already near-optimal here, so Step-1 denoising has
+      little to recover (the 2026-07-03 finding).
+    * ``"structured_loops"`` (Task 4.5.2 low-SNR regime) — the clutter is a set
+      of secondary *decoy circles* of persistence comparable to the signal loop,
+      present only in the observed clouds (never in the clean estimand).  Because
+      the power-weighted silhouette sums ``|d-b|^r`` over *all* features, the
+      decoys contaminate the raw silhouette; a working Step-2 ``pi_p`` weighting /
+      Maroulas denoising should down-weight them and recover the clean effect.
+      This is the regime where the Bayesian pipeline can genuinely beat the
+      raw-silhouette frequentist (or, if it cannot, that is the honest negative
+      result of Phase 4.5).
+    """
 
     n: int = 60
     num_pts: int = 120
@@ -56,6 +75,14 @@ class SyntheticConfig:
     base_jitter: float = 0.02
     base_clutter: int = 12
     center: tuple[float, float] = (0.5, 0.5)
+    # --- low-SNR / heavy-clutter regime (Task 4.5.2) ---
+    clutter_mode: str = "annulus"          # "annulus" | "structured_loops"
+    n_decoy_loops: int = 4                  # decoy circles per NOISE unit
+    decoy_points: int = 22                  # points per decoy circle
+    decoy_radius_frac: float = 0.55         # decoy radius / signal radius
+    decoy_radius_jitter: float = 0.18       # rel. spread of decoy radii across decoys
+    decoy_jitter_frac: float = 1.0          # decoy radial jitter (x base_jitter*noise)
+    decoy_spread: float = 1.6               # decoy-center distance (x signal radius)
     seed: int = 20260701
     noise_seed: int | None = None   # separate stream for jitter/clutter (MC estimand)
 
@@ -129,11 +156,40 @@ def _clutter(n_clutter: int, center, radius: float,
     ])
 
 
-def _arm_cloud(radius: float, cfg: SyntheticConfig, jitter: float,
-               n_clutter: int, rng: np.random.Generator) -> np.ndarray:
-    loop = _noisy_circle(radius, cfg.num_pts, jitter, cfg.center, rng)
-    clutter = _clutter(n_clutter, cfg.center, radius, rng)
-    cloud = np.vstack([loop, clutter])
+def _decoy_loops(n_loops: int, points_per: int, cfg: SyntheticConfig,
+                 radius: float, jitter: float, rng: np.random.Generator) -> np.ndarray:
+    """Structured clutter: secondary circles of persistence near the signal.
+
+    Each decoy is a noisy circle whose radius is a jittered fraction of the
+    signal radius (so its H1 feature has *moderate* persistence, comparable to
+    the signal loop), centred at a random offset from the signal centre.  These
+    are the features a working ``pi_p`` / Maroulas denoiser must suppress; the
+    raw power-weighted silhouette cannot.
+    """
+    if n_loops <= 0 or points_per <= 0:
+        return np.empty((0, 2), dtype=float)
+    parts = []
+    base_r = cfg.decoy_radius_frac * radius
+    for _ in range(n_loops):
+        rk = base_r * (1.0 + cfg.decoy_radius_jitter * rng.normal())
+        rk = max(rk, 0.05 * radius)
+        ang = rng.uniform(0.0, 2.0 * np.pi)
+        dist = cfg.decoy_spread * radius * np.sqrt(rng.uniform(0.15, 1.0))
+        cx = cfg.center[0] + dist * np.cos(ang)
+        cy = cfg.center[1] + dist * np.sin(ang)
+        parts.append(_noisy_circle(rk, points_per, jitter, (cx, cy), rng))
+    return np.vstack(parts)
+
+
+def _arm_cloud(radius: float, cfg: SyntheticConfig, signal_jitter: float,
+               n_clutter: int, n_decoy: int, decoy_jitter: float,
+               rng: np.random.Generator) -> np.ndarray:
+    loop = _noisy_circle(radius, cfg.num_pts, signal_jitter, cfg.center, rng)
+    parts = [loop, _clutter(n_clutter, cfg.center, radius, rng)]
+    if cfg.clutter_mode == "structured_loops":
+        parts.append(_decoy_loops(n_decoy, cfg.decoy_points, cfg, radius,
+                                  decoy_jitter, rng))
+    cloud = np.vstack(parts)
     # Pad to a fixed width so realizations stack into one array.
     return cloud
 
@@ -170,7 +226,23 @@ def generate_synthetic_dataset(config: SyntheticConfig) -> SyntheticDataset:
 
     jitter = cfg.base_jitter * cfg.noise_level
     n_clutter = int(round(cfg.base_clutter * cfg.noise_level))
-    width = cfg.num_pts + n_clutter
+    if cfg.clutter_mode == "structured_loops":
+        # Low-SNR regime: the *signal* loop stays clean and stably persistent
+        # (jitter fixed at base_jitter, not amplified by noise), while
+        # ``noise_level`` scales the number of competing moderate-persistence
+        # decoys.  Decoys use a small, noise-independent jitter so their
+        # persistence forms a tight band that sits *below* the signal with a
+        # gap — separable in principle, so the DP partition can suppress them.
+        signal_jitter = cfg.base_jitter
+        n_decoy = int(round(cfg.n_decoy_loops * cfg.noise_level))
+        decoy_jitter = cfg.decoy_jitter_frac * cfg.base_jitter
+        decoy_total = n_decoy * cfg.decoy_points
+    else:
+        signal_jitter = jitter
+        n_decoy = 0
+        decoy_jitter = jitter
+        decoy_total = 0
+    width = cfg.num_pts + n_clutter + decoy_total
     # The clean reference uses the *same* loop-sampling density as the observed
     # clouds (no clutter, negligible jitter), so the estimand isolates the
     # topological-noise / clutter effect rather than a point-count artifact.
@@ -181,7 +253,8 @@ def generate_synthetic_dataset(config: SyntheticConfig) -> SyntheticDataset:
     for i in range(cfg.n):
         r0, r1 = radii[i], radii[i] + effs[i]
         for arm, radius in ((0, r0), (1, r1)):
-            noisy = _arm_cloud(radius, cfg, jitter, n_clutter, nrng)
+            noisy = _arm_cloud(radius, cfg, signal_jitter, n_clutter, n_decoy,
+                               decoy_jitter, nrng)
             clouds[i, arm, : noisy.shape[0]] = noisy
             if noisy.shape[0] < width:  # pad by repeating loop points
                 pad = width - noisy.shape[0]
@@ -195,11 +268,53 @@ def generate_synthetic_dataset(config: SyntheticConfig) -> SyntheticDataset:
         meta={
             "jitter": jitter,
             "n_clutter": n_clutter,
+            "clutter_mode": cfg.clutter_mode,
+            "n_decoy_loops": n_decoy,
+            "decoy_points_total": decoy_total,
             "loop_points": cfg.num_pts,
             "clean_points": clean_pts,
             "treated_frac": float(np.mean(A)),
             "propensity_range": [float(pi.min()), float(pi.max())],
         },
+    )
+
+
+def standard_config(n: int = 120, noise_level: float = 1.0,
+                    effect_size: float = 0.12, overlap_strength: float = 0.8,
+                    seed: int = 20260701, **overrides) -> SyntheticConfig:
+    """The standard Phase-4 annulus-clutter DGP (raw silhouette near-optimal)."""
+    return replace(
+        SyntheticConfig(
+            n=n, noise_level=noise_level, effect_size=effect_size,
+            overlap_strength=overlap_strength, seed=seed, clutter_mode="annulus",
+        ),
+        **overrides,
+    )
+
+
+def low_snr_config(n: int = 120, noise_level: float = 2.0,
+                   effect_size: float = 0.12, overlap_strength: float = 0.8,
+                   seed: int = 20260701, **overrides) -> SyntheticConfig:
+    """The Task-4.5.2 low-SNR / heavy-clutter DGP (raw silhouette contaminated).
+
+    A clean, stably-persistent signal loop is surrounded by many competing
+    moderate-persistence decoy circles (count scales with ``noise_level``), so
+    the power-weighted silhouette sums spurious mass the clean estimand does not
+    contain.  This is the regime where Step-1 / ``pi_p`` denoising *can* earn its
+    keep — or, if it cannot, where the honest negative result of Phase 4.5 is
+    established.  Defaults are locked here so the sweep and notebook share one
+    definition.
+    """
+    return replace(
+        SyntheticConfig(
+            n=n, noise_level=noise_level, effect_size=effect_size,
+            overlap_strength=overlap_strength, seed=seed,
+            clutter_mode="structured_loops",
+            base_radius=0.35, num_pts=140, base_clutter=12,
+            n_decoy_loops=8, decoy_points=24, decoy_radius_frac=0.45,
+            decoy_radius_jitter=0.18, decoy_jitter_frac=1.0, decoy_spread=1.6,
+        ),
+        **overrides,
     )
 
 

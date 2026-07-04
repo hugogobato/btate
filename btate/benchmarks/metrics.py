@@ -75,6 +75,26 @@ def simultaneous_coverage(lower, upper, truth) -> float:
     return float(np.all((truth >= lower) & (truth <= upper)))
 
 
+def clopper_pearson(successes: int, n: int, alpha: float = 0.05) -> tuple[float, float]:
+    """Exact (Clopper–Pearson) binomial confidence interval for a coverage rate.
+
+    Returns ``(lo, hi)`` at confidence ``1 - alpha`` for ``k = successes`` out of
+    ``n`` Bernoulli trials, using the Beta-quantile form.  Used to attach honest
+    Monte-Carlo error bars to the simultaneous-coverage rates in the Phase-4.5
+    decision grid (a coverage of ``k/n`` with small ``n`` is nearly
+    uninformative; ≥50 reps are required for a ±0.06 bound near 0.95).
+    """
+    from scipy.stats import beta as _beta
+
+    n = int(n)
+    k = int(successes)
+    if n <= 0:
+        return (float("nan"), float("nan"))
+    lo = 0.0 if k == 0 else float(_beta.ppf(alpha / 2.0, k, n - k + 1))
+    hi = 1.0 if k == n else float(_beta.ppf(1.0 - alpha / 2.0, k + 1, n - k))
+    return (lo, hi)
+
+
 def interval_width(lower, upper, tseq=None) -> float:
     """Mean band width, or grid-averaged width if ``tseq`` is given."""
     lower = np.asarray(lower, dtype=float)

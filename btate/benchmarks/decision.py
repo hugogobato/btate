@@ -31,9 +31,12 @@ from btate.causal import FunctionalGPEstimator, compare_propagation
 from btate.topo_posterior import bd_to_bp
 
 from .frequentist import aipw_effect
+from .maroulas_diagnostics import _bundle_for_subject, _prior_bundle
 from .metrics import (
-    bias, clopper_pearson, integrated_bias, interval_width, max_abs_error,
-    pointwise_coverage, rmse, simultaneous_coverage,
+    bias, clopper_pearson, fundamental_floor, integrated_bias, interval_width,
+    max_abs_error, peak_abs_error, peak_localized_coverage,
+    peak_pointwise_coverage, peak_retention, peak_signed_bias, pointwise_coverage,
+    rmse, simultaneous_coverage,
 )
 from .pipeline import (
     PipelineConfig, _auto_sample_range, _subject_embedding_draws, h1_diagram,
@@ -55,11 +58,16 @@ class FGPVariant:
 
     ``sigma_dyo_multiplier`` and ``fgp_posterior_scale`` accept the same values
     as :class:`PipelineConfig` (floats or the ``"eb"`` / ``"godambe"`` sentinels).
+    ``prior_variant`` selects the Step-1 elicitation (Research_Plan Task 5.2):
+    ``"pooled"`` (default), ``"arm_aware"`` (sensitivity), ``"peak_preserving"``
+    (label-free de-biased, Task 5.3) or ``"hierarchical"`` (partial-pooling
+    legitimate arm-aware, Task 5.4).
     """
 
     label: str
     sigma_dyo_multiplier: float | str = 3.0
     fgp_posterior_scale: float | str = 8.0
+    prior_variant: str = "pooled"
 
 
 @dataclass
@@ -78,33 +86,21 @@ class DecisionCell:
     )
     run_frequentist: bool = True
     run_bcf: bool = False
-    # BCF reuses the embedding of this (weights, sigma_dyo_multiplier) group.
+    # BCF reuses the embedding of this (weights, prior_variant, sigma) group.
     bcf_weights: str = "power"
+    bcf_prior_variant: str = "pooled"
     bcf_sigma_dyo_multiplier: float | str = "eb"
     bcf_kwargs: dict = field(default_factory=dict)
     mc_realizations: int = 24
+    # peak-window half-width (grid points) for the peak-localised coverage (P5.1)
+    peak_window: int = 6
+    diffuse_sigma_multiplier: float = 10.0
     seed_offset: int = DECISION_SEED_OFFSET
 
 
 # --------------------------------------------------------------------------- #
 # Per-replicate evaluation
 # --------------------------------------------------------------------------- #
-def _fit_prior_clutter(diagrams, pipe: PipelineConfig):
-    from btate.topo_posterior.elicitation import elicit_prior_clutter
-
-    train_bp = [bd_to_bp(d) for d in diagrams if d.shape[0] > 0]
-    if not train_bp:
-        raise ValueError("cannot fit Maroulas prior: all diagrams are empty")
-    mean_card = max(1, int(np.mean([len(d) for d in train_bp])))
-    prior, clutter = elicit_prior_clutter(
-        train_bp,
-        n_components=min(pipe.prior_components, mean_card),
-        clutter_n_components=pipe.clutter_components,
-        random_state=pipe.seed,
-    )
-    return prior, clutter, train_bp
-
-
 def _observed_fixed_silhouette(diagrams, pipe: PipelineConfig, sample_range):
     from btate.embeddings import posterior_embedding_summary
 
@@ -118,15 +114,41 @@ def _observed_fixed_silhouette(diagrams, pipe: PipelineConfig, sample_range):
     return np.stack(curves)
 
 
-def _embedding_draws(diagrams, prior, clutter, pipe, sample_range):
+def _bundle_embedding_draws(diagrams, bundle, A, pipe, sample_range, train_bp):
+    """Per-subject posterior functional draws using a (possibly arm-specific) bundle.
+
+    For pooled/peak_preserving/diffuse the same ``(prior, clutter)`` is used for
+    every subject; for arm_aware/hierarchical each subject uses the elicitation of
+    its own treatment arm.  ``sigma_DYO`` is resolved once per **distinct prior
+    object** (so a shared pooled prior is not re-optimised per arm — the ``"eb"``
+    path is costly), and the marginal-likelihood objective always uses the pooled
+    ``train_bp`` so the EB target is arm-agnostic.
+
+    Returns ``(phi_draws (S, n, res), grid, sigma_infos)`` where ``sigma_infos``
+    maps the prior object id -> the resolved sigma dict.
+    """
+    A = np.asarray(A, dtype=int).ravel()
+    sig_cache: dict[int, dict] = {}
+
+    def sigma_info(prior_a, clutter_a) -> dict:
+        key = id(prior_a)
+        if key not in sig_cache:
+            sig_cache[key] = resolve_sigma_dyo(
+                prior_a, pipe, diagrams_bp=train_bp, clutter=clutter_a)
+        return sig_cache[key]
+
     per_subject = []
     grid = None
     for i, d in enumerate(diagrams):
+        arm = int(A[i])
+        prior_i, clutter_i = _bundle_for_subject(bundle, arm)
+        pipe_i = replace(pipe, sigma_dyo=sigma_info(prior_i, clutter_i)["sigma_dyo"])
         draws, grid = _subject_embedding_draws(
-            d, prior, clutter, pipe, sample_range, seed=pipe.seed + 1000 * i,
+            d, prior_i, clutter_i, pipe_i, sample_range, seed=pipe.seed + 1000 * i,
         )
         per_subject.append(draws)
-    return np.transpose(np.stack(per_subject), (1, 0, 2)), grid
+    phi = np.transpose(np.stack(per_subject), (1, 0, 2))
+    return phi, grid, sig_cache
 
 
 def _dr_effect(curves, A, pi, clip):
@@ -143,10 +165,16 @@ def _band_rejects(lower, upper) -> bool:
 
 
 def _score(effect, ref_clean, ref_mc, grid, model, weights, sigma_label,
-           scale_label, extra=None) -> dict:
-    """Common metric row for any effect posterior (FGP / BCF / frequentist)."""
+           scale_label, prior_variant="pooled", peak_window=6, extra=None) -> dict:
+    """Common metric row for any effect posterior (FGP / BCF / frequentist).
+
+    RMSE/bias/coverage are always scored against the **clean** estimand
+    ``ref_clean = psi_d`` (Research_Plan Task 5.1).  ``F`` is the cell's
+    fundamental floor and ``peak_*`` are the apex-localised metrics that the probe
+    showed carry the whole ``cov_sim_clean`` failure.
+    """
     rec = {
-        "model": model, "weights": weights,
+        "model": model, "weights": weights, "prior_variant": prior_variant,
         "sigma_setting": sigma_label, "scale_setting": scale_label,
         "rmse": rmse(effect.mean, ref_clean),          # RMSE always vs clean truth
         "bias": bias(effect.mean, ref_clean),
@@ -163,6 +191,15 @@ def _score(effect, ref_clean, ref_mc, grid, model, weights, sigma_label,
         "width": interval_width(
             effect.simultaneous_lower, effect.simultaneous_upper, grid),
         "reject": _band_rejects(effect.simultaneous_lower, effect.simultaneous_upper),
+        # --- Phase-5 peak-first metrics (all anchored at the clean apex) ---
+        "F": fundamental_floor(ref_mc, ref_clean),
+        "peak_bias": peak_signed_bias(effect.mean, ref_clean),
+        "peak_abs_err": peak_abs_error(effect.mean, ref_clean),
+        "peak_retention": peak_retention(effect.mean, ref_clean),
+        "cov_peak_clean": peak_localized_coverage(
+            effect.simultaneous_lower, effect.simultaneous_upper, ref_clean, peak_window),
+        "cov_peak_pw_clean": peak_pointwise_coverage(
+            effect.pointwise_lower, effect.pointwise_upper, ref_clean, peak_window),
     }
     if extra:
         rec.update(extra)
@@ -190,7 +227,9 @@ def evaluate_decision_rep(cell: DecisionCell, rep: int) -> list[dict]:
     observed_effect = _dr_effect(phi_obs, A, pi, base.propensity_clip)
     observed_l2 = float(np.sqrt(np.mean(observed_effect ** 2)))
 
-    prior, clutter, train_bp = _fit_prior_clutter(diagrams, base)
+    train_bp = [bd_to_bp(d) for d in diagrams if d.shape[0] > 0]
+    if not train_bp:
+        raise ValueError("cannot fit Maroulas prior: all diagrams are empty")
     rows: list[dict] = []
     id_fields = {
         "cell": cell.name, "rep": int(rep), "n": int(synth.n),
@@ -199,34 +238,44 @@ def evaluate_decision_rep(cell: DecisionCell, rep: int) -> list[dict]:
         "effect_size": float(synth.effect_size),
         "overlap_strength": float(synth.overlap_strength),
     }
+    pw = cell.peak_window
 
     grid = None
     for weights in cell.weights_variants:
-        # Every FGP variant is evaluated under each requested embedding weight;
-        # its Maroulas embedding is shared by sigma_dyo_multiplier.
-        sigma_settings = {v.sigma_dyo_multiplier for v in cell.fgp_variants}
+        # Each FGP/BCF competitor needs the Maroulas embedding of its
+        # (prior_variant, sigma_dyo_multiplier) group; build every distinct group
+        # once and share it across the Step-4 models that request it.
+        groups = {(v.prior_variant, v.sigma_dyo_multiplier) for v in cell.fgp_variants}
         if cell.run_bcf and weights == cell.bcf_weights:
-            sigma_settings.add(cell.bcf_sigma_dyo_multiplier)
+            groups.add((cell.bcf_prior_variant, cell.bcf_sigma_dyo_multiplier))
 
-        for sigma_mult in sigma_settings:
+        for prior_variant, sigma_mult in groups:
             pipe_s = replace(base, weights=weights, sigma_dyo=None,
                              sigma_dyo_multiplier=sigma_mult)
-            info = resolve_sigma_dyo(prior, pipe_s, diagrams_bp=train_bp, clutter=clutter)
-            pipe_s = replace(pipe_s, sigma_dyo=info["sigma_dyo"])
-            phi_draws, grid = _embedding_draws(diagrams, prior, clutter, pipe_s, sample_range)
+            bundle = _prior_bundle(
+                diagrams, A, pipe_s, prior_variant=prior_variant,
+                diffuse_sigma_multiplier=cell.diffuse_sigma_multiplier,
+            )
+            phi_draws, grid, sig_cache = _bundle_embedding_draws(
+                diagrams, bundle, A, pipe_s, sample_range, train_bp)
+            sig_vals = [float(v["sigma_dyo"]) for v in sig_cache.values()]
+            mult_vals = [float(v["sigma_dyo_multiplier"]) for v in sig_cache.values()]
             topo_mean = phi_draws.mean(axis=0)
             topo_effect = _dr_effect(topo_mean, A, pi, base.propensity_clip)
             topo_l2 = float(np.sqrt(np.mean(topo_effect ** 2)))
             atten = topo_l2 / observed_l2 if observed_l2 > 1e-12 else float("nan")
+            # Peak retention of the Step-1 DR effect itself (pre-FGP), the probe's
+            # curability signal, scored against the clean apex.
             aux = {
-                "sigma_dyo": float(info["sigma_dyo"]),
-                "sigma_dyo_multiplier": float(info["sigma_dyo_multiplier"]),
+                "sigma_dyo": float(np.median(sig_vals)),
+                "sigma_dyo_multiplier": float(np.nanmedian(mult_vals)),
                 "topo_l2_attenuation_ratio": atten,
+                "topo_peak_retention": peak_retention(topo_effect, ref_clean),
             }
 
-            # --- FGP variants sharing this (weights, sigma) embedding ---
+            # --- FGP variants sharing this (prior_variant, sigma) embedding ---
             for v in cell.fgp_variants:
-                if v.sigma_dyo_multiplier != sigma_mult:
+                if (v.prior_variant, v.sigma_dyo_multiplier) != (prior_variant, sigma_mult):
                     continue
                 est = FunctionalGPEstimator(
                     n_inducing=pipe_s.n_inducing, prior_scale=pipe_s.prior_scale,
@@ -250,10 +299,12 @@ def evaluate_decision_rep(cell: DecisionCell, rep: int) -> list[dict]:
                              pr_excludes_zero=float(eff.pr_excludes_zero))
                 rows.append({**id_fields, **_score(
                     eff, ref_clean, ref_mc, grid, f"fgp_{v.label}", weights,
-                    str(v.sigma_dyo_multiplier), str(v.fgp_posterior_scale), extra)})
+                    str(v.sigma_dyo_multiplier), str(v.fgp_posterior_scale),
+                    prior_variant=prior_variant, peak_window=pw, extra=extra)})
 
             # --- functional BCF on the same embedding (plug-in) ---
             if (cell.run_bcf and weights == cell.bcf_weights
+                    and prior_variant == cell.bcf_prior_variant
                     and sigma_mult == cell.bcf_sigma_dyo_multiplier):
                 from btate.causal import fit_tsbcf_tate
                 bcf = fit_tsbcf_tate(
@@ -262,7 +313,8 @@ def evaluate_decision_rep(cell: DecisionCell, rep: int) -> list[dict]:
                 extra = dict(aux, pr_excludes_zero=float(bcf.pr_excludes_zero))
                 rows.append({**id_fields, **_score(
                     bcf, ref_clean, ref_mc, grid, "bcf", weights,
-                    str(sigma_mult), "bcf", extra)})
+                    str(sigma_mult), "bcf", prior_variant=prior_variant,
+                    peak_window=pw, extra=extra)})
 
     # --- frequentist AIPW on the fixed-r observed silhouette (once) ---
     # Doubly-robust EIF AIPW with pointwise + multiplier-bootstrap uniform bands
@@ -281,16 +333,19 @@ def evaluate_decision_rep(cell: DecisionCell, rep: int) -> list[dict]:
             simultaneous_upper = fe.simultaneous_upper
         rows.append({**id_fields, **_score(
             _FreqEff(), ref_clean, ref_mc, gref, "frequentist", "power",
-            "raw", "aipw")})
+            "raw", "aipw", prior_variant="none", peak_window=pw)})
     return rows
 
 
 # --------------------------------------------------------------------------- #
 # Aggregation with Clopper–Pearson error bars
 # --------------------------------------------------------------------------- #
-_GROUP_KEYS = ("cell", "model", "weights", "sigma_setting", "scale_setting")
+_GROUP_KEYS = ("cell", "model", "weights", "prior_variant", "sigma_setting",
+               "scale_setting")
 _ID_KEYS = ("n", "clutter_mode", "noise_level", "effect_size", "overlap_strength")
-_COVERAGE_KEYS = ("cov_sim_clean", "cov_sim_mc")
+# Coverage rates get Clopper–Pearson bars; ``cov_peak_clean`` is the Phase-5
+# decision-relevant one (simultaneous coverage of the apex, not the tails).
+_COVERAGE_KEYS = ("cov_sim_clean", "cov_sim_mc", "cov_peak_clean")
 
 
 def aggregate_decision(records: list[dict]) -> list[dict]:

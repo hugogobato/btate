@@ -45,12 +45,53 @@ def _kmeans(points, k, random_state):
     return centroids, labels, k
 
 
+def _signal_atom(points, persistence_quantile, sigma_scale, weight,
+                 n_diagrams, spread):
+    """A label-free long-lifetime prior component (Research_Plan Task 5.3).
+
+    The pooled k-means prior places its mass where the *bulk* of features sit —
+    low/moderate persistence, because clutter dominates the point count.  A
+    high-persistence observed signal feature therefore has no nearby prior
+    component and the Maroulas posterior mean shrinks it *down* toward the
+    clutter centroids, contracting the silhouette peak (the P4.25/probe
+    over-smoothing).  This atom adds one deliberately **heavy-tailed** Gaussian
+    centred on the empirical long-lived features (top ``persistence_quantile`` of
+    the pooled persistence axis), so the signal has a prior explanation and is
+    pulled far less.  It reads the treatment label **nowhere** — only the pooled
+    persistence distribution — so it is estimand-legitimate (unlike arm-aware).
+
+    Returns ``(mu, var, weight)`` for the extra component, or ``None`` if there
+    are too few long-lived points to define one.
+    """
+    persistence = np.asarray(points, dtype=float)[:, 1]
+    if persistence.size < 2:
+        return None
+    thr = float(np.quantile(persistence, persistence_quantile))
+    sel = persistence >= thr
+    n_sig = int(sel.sum())
+    if n_sig < 1:
+        return None
+    sig_pts = np.asarray(points, dtype=float)[sel]
+    mu = sig_pts.mean(axis=0)
+    # Heavy tail: cover the spread of the long-lived points, floored so a single
+    # signal feature per diagram still yields a broad (non-degenerate) atom.
+    var = sigma_scale * max(float(sig_pts.var(axis=0).mean()), 1e-3 * spread + 1e-12)
+    if weight is None:
+        # Expected number of long-lived features per diagram (~1 for one loop).
+        weight = max(n_sig / float(n_diagrams), 1e-3)
+    return np.asarray(mu, dtype=float), float(var), float(weight)
+
+
 def elicit_prior_clutter(train_diagrams, n_components: int | None = None,
                          sigma: float | None = None,
                          clutter_n_components: int = 1,
                          clutter_sigma_scale: float = 4.0,
                          clutter_weight_scale: float = 1.0,
                          min_birth: float = 0.0, weight_floor: float = 1e-6,
+                         signal_atom: bool = False,
+                         signal_atom_persistence_quantile: float = 0.85,
+                         signal_atom_sigma_scale: float = 6.0,
+                         signal_atom_weight: float | None = None,
                          random_state=None):
     """Elicit ``(prior, clutter)`` as ``bayes_tda`` ``RGaussianMixture`` objects.
 
@@ -73,6 +114,18 @@ def elicit_prior_clutter(train_diagrams, n_components: int | None = None,
         ``0`` for Rips, ``-inf`` for sublevel/cubical filtrations.
     weight_floor : float
         Lower bound on component weights (avoids empty-cluster zeros).
+    signal_atom : bool
+        If ``True``, append the label-free peak-preserving long-lifetime prior
+        component (Research_Plan Task 5.3; see :func:`_signal_atom`).  This is the
+        Phase-5 de-biased Step-1 prior.
+    signal_atom_persistence_quantile : float
+        Pooled-persistence quantile above which points are treated as the
+        long-lived signal population that anchors the atom.
+    signal_atom_sigma_scale : float
+        Heavy-tail multiplier on the long-lived points' variance (larger = more
+        diffuse atom, less peak shrinkage but weaker denoising).
+    signal_atom_weight : float, optional
+        Prior mass on the atom (default: expected long-lived features / diagram).
     random_state : int | np.random.Generator, optional
 
     Returns
@@ -100,6 +153,7 @@ def elicit_prior_clutter(train_diagrams, n_components: int | None = None,
     prior_weights = np.maximum(counts / n_diagrams, weight_floor)
 
     # component variance (per axis): within-cluster mean squared radius / 2.
+    spread = points.var(axis=0).mean()
     if sigma is None:
         sq = ((points - centroids[labels]) ** 2).sum(axis=1)
         within = np.zeros(k)
@@ -107,13 +161,24 @@ def elicit_prior_clutter(train_diagrams, n_components: int | None = None,
             sel = labels == j
             within[j] = sq[sel].mean() / 2.0 if sel.any() else 0.0
         # floor to a small fraction of the data spread to avoid degenerate spikes.
-        spread = points.var(axis=0).mean()
         prior_sigmas = np.maximum(within, 1e-3 * spread + 1e-12)
     else:
         prior_sigmas = np.full(k, float(sigma))
 
+    prior_mus = np.atleast_2d(centroids)
+    if signal_atom:
+        atom = _signal_atom(
+            points, signal_atom_persistence_quantile, signal_atom_sigma_scale,
+            signal_atom_weight, n_diagrams, spread,
+        )
+        if atom is not None:
+            mu, var, w = atom
+            prior_mus = np.vstack([prior_mus, mu[None, :]])
+            prior_sigmas = np.concatenate([prior_sigmas, [var]])
+            prior_weights = np.concatenate([prior_weights, [w]])
+
     prior = RGaussianMixture(
-        mus=np.atleast_2d(centroids), sigmas=prior_sigmas, weights=prior_weights,
+        mus=prior_mus, sigmas=prior_sigmas, weights=prior_weights,
         normalize_weights=False, min_birth=min_birth,
     )
 

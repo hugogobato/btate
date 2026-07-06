@@ -23,7 +23,19 @@ from btate.embeddings import posterior_embedding_summary
 from btate.topo_posterior import bd_to_bp
 
 
-_PRIOR_VARIANTS = {"pooled", "diffuse_pooled", "arm_aware"}
+_PRIOR_VARIANTS = {
+    "pooled", "diffuse_pooled", "arm_aware",
+    # Phase-5 additions:
+    "peak_preserving",   # label-free signal atom (Task 5.3) — no treatment label
+    "hierarchical",      # partial-pooling arm-aware (Task 5.4) — legitimate arm use
+}
+
+# Partial-pooling strength for the ``hierarchical`` variant: the arm-specific
+# mixture is appended to the shared pooled base with its mass scaled by this
+# factor, so as ``rho -> 0`` it collapses to full pooling and as ``rho`` grows it
+# approaches two independent arm fits.  A modest value keeps the shared base
+# dominant, so the prior cannot encode the treatment effect itself (Task 5.4).
+_HIERARCHICAL_RHO = 0.5
 
 
 def _ipw_effect(curves, A, pi_hat, clip: float) -> np.ndarray:
@@ -68,7 +80,8 @@ def _inflate_mixture(mixture, factor: float):
     )
 
 
-def _fit_prior_clutter(train_bp, pipe: PipelineConfig, random_state, diffuse_factor: float):
+def _fit_prior_clutter(train_bp, pipe: PipelineConfig, random_state, diffuse_factor: float,
+                       signal_atom: bool = False):
     from btate.topo_posterior.elicitation import elicit_prior_clutter
 
     if not train_bp:
@@ -78,12 +91,37 @@ def _fit_prior_clutter(train_bp, pipe: PipelineConfig, random_state, diffuse_fac
         train_bp,
         n_components=min(pipe.prior_components, mean_card),
         clutter_n_components=pipe.clutter_components,
+        signal_atom=signal_atom,
         random_state=random_state,
     )
     if diffuse_factor != 1.0:
         prior = _inflate_mixture(prior, diffuse_factor)
         clutter = _inflate_mixture(clutter, diffuse_factor)
     return prior, clutter
+
+
+def _combine_mixtures(base, extra, extra_weight_scale: float):
+    """Partial-pooling: append ``extra``'s components to ``base`` with scaled mass.
+
+    Used for the ``hierarchical`` prior — the shared pooled base plus a shrunk
+    arm-specific deviation, so information is shared at a higher level rather than
+    fit twice independently (Research_Plan Task 5.4).
+    """
+    from bayes_tda.intensities import RGaussianMixture
+
+    mus = np.vstack([np.atleast_2d(base.mus), np.atleast_2d(extra.mus)])
+    sigmas = np.concatenate([
+        np.asarray(base.sigmas, dtype=float).ravel(),
+        np.asarray(extra.sigmas, dtype=float).ravel(),
+    ])
+    weights = np.concatenate([
+        np.asarray(base.weights, dtype=float).ravel(),
+        float(extra_weight_scale) * np.asarray(extra.weights, dtype=float).ravel(),
+    ])
+    return RGaussianMixture(
+        mus=mus, sigmas=sigmas, weights=weights, normalize_weights=False,
+        tilted=base.tilted, min_birth=base.min_birth, fastQ=base.fastQ,
+    )
 
 
 def _prior_bundle(diagrams, A, pipe: PipelineConfig, prior_variant: str,
@@ -106,22 +144,43 @@ def _prior_bundle(diagrams, A, pipe: PipelineConfig, prior_variant: str,
                 all_bp, pipe, pipe.seed, diffuse_factor=diffuse_sigma_multiplier,
             ),
         }
+    if prior_variant == "peak_preserving":
+        # Label-free de-biased Step-1: the same pooled elicitation, plus the
+        # long-lifetime signal atom so the posterior mean stops shrinking the
+        # silhouette peak.  Uses no treatment label (Task 5.3).
+        return {
+            "kind": prior_variant,
+            "pooled": _fit_prior_clutter(
+                all_bp, pipe, pipe.seed, diffuse_factor=1.0, signal_atom=True,
+            ),
+        }
 
+    # arm_aware and hierarchical both need per-arm fits.
     out = {"kind": prior_variant, "pooled": pooled}
     A = np.asarray(A, dtype=int).ravel()
+    pooled_prior, pooled_clutter = pooled
     for arm in (0, 1):
         arm_bp = [bd_to_bp(d) for d, a in zip(diagrams, A) if a == arm and d.shape[0] > 0]
-        if arm_bp:
-            out[arm] = _fit_prior_clutter(
-                arm_bp, pipe, pipe.seed + 101 * (arm + 1), diffuse_factor=1.0,
-            )
-        else:
+        if not arm_bp:
             out[arm] = pooled
+            continue
+        arm_prior, arm_clutter = _fit_prior_clutter(
+            arm_bp, pipe, pipe.seed + 101 * (arm + 1), diffuse_factor=1.0,
+        )
+        if prior_variant == "hierarchical":
+            # Partial pooling: shared pooled base + shrunk arm-specific deviation.
+            merged = _combine_mixtures(pooled_prior, arm_prior, _HIERARCHICAL_RHO)
+            out[arm] = (merged, pooled_clutter)
+        else:  # arm_aware — two independent fits (sensitivity analysis)
+            out[arm] = (arm_prior, arm_clutter)
     return out
 
 
+_PER_ARM_KINDS = {"arm_aware", "hierarchical"}
+
+
 def _bundle_for_subject(bundle, arm: int):
-    if bundle["kind"] == "arm_aware":
+    if bundle["kind"] in _PER_ARM_KINDS:
         return bundle[int(arm)]
     return bundle["pooled"]
 

@@ -216,7 +216,9 @@ def evaluate_decision_rep(cell: DecisionCell, rep: int) -> list[dict]:
     dataset = generate_synthetic_dataset(synth)
     A, X, pi = dataset.A, dataset.X, dataset.pi
     diagrams = [h1_diagram(c) for c in dataset.observed_clouds()]
-    sample_range = base.sample_range or _auto_sample_range(diagrams)
+    # Phase 5.5 fix: compute sample range from clean diagrams to prevent truncation by clutter
+    clean_diagrams_for_range = [h1_diagram(dataset.clean_clouds[i, int(dataset.A[i])]) for i in range(len(dataset.A))]
+    sample_range = base.fixed_sample_range or base.sample_range or _auto_sample_range(diagrams, clean_diagrams=clean_diagrams_for_range)
 
     ref_fn = silhouette_embedding_fn(base, sample_range)
     ref_clean = reference_effect(dataset, ref_fn, tseq=None)

@@ -17,7 +17,11 @@ btate.benchmarks`` always succeeds in a minimal environment.
 from __future__ import annotations
 
 from .metrics import (
+    apex_floor,
+    apex_location,
+    apex_shift,
     bias,
+    death_recovery,
     integrated_bias,
     interval_width,
     l1_distance,
@@ -44,6 +48,10 @@ __all__ = [
     "pointwise_coverage",
     "simultaneous_coverage",
     "interval_width",
+    "apex_location",
+    "apex_shift",
+    "apex_floor",
+    "death_recovery",
 ]
 
 
@@ -70,6 +78,8 @@ def __getattr__(name):  # PEP 562 lazy access to the heavier submodules
         "JointCalibrationCell": "joint_calibration",
         "run_joint_calibration": "joint_calibration",
         "aggregate_joint_records": "joint_calibration",
+        "h1_diagram_dtm": "dtm", "h1_diagram_filtration": "dtm",
+        "top_feature_death": "dtm", "dtm_death_sweep": "dtm",
     }
     if name in submodules:
         mod = importlib.import_module(f"{__name__}.{submodules[name]}")

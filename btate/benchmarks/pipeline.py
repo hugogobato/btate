@@ -44,6 +44,7 @@ class PipelineConfig:
     r: float = 3.0
     num_landscapes: int = 3
     sample_range: tuple[float, float] | None = None   # auto from data if None
+    fixed_sample_range: tuple[float, float] | None = None
     resolution: int = 80
 
     # --- Step 1 posterior diagram draws ---
@@ -116,11 +117,18 @@ def h1_diagram(points: np.ndarray) -> np.ndarray:
     return np.sqrt(dgm)
 
 
-def _auto_sample_range(diagrams) -> tuple[float, float]:
-    deaths = [d[:, 1].max() for d in diagrams if d.shape[0] > 0]
+def _auto_sample_range(diagrams, clean_diagrams=None) -> tuple[float, float]:
+    target_diagrams = clean_diagrams if clean_diagrams is not None else diagrams
+    deaths = [d[:, 1].max() for d in target_diagrams if d.shape[0] > 0]
     if not deaths:
         return (0.0, 1.0)
     return (0.0, float(1.05 * max(deaths)))
+
+
+def _clean_sample_range(clean_clouds) -> tuple[float, float]:
+    """Compute the sample range from clean point clouds (Phase 5.5 fix)."""
+    clean_diagrams = [h1_diagram(c) for c in clean_clouds]
+    return _auto_sample_range(clean_diagrams)
 
 
 def _jitter_draws(diagram_bd, n_draws, sigma, rng):
@@ -311,7 +319,7 @@ def run_bayesian_pipeline(clouds, A, X, pi_hat, cfg: PipelineConfig) -> Pipeline
     t0 = time.perf_counter()
 
     diagrams = [h1_diagram(c) for c in clouds]
-    sample_range = cfg.sample_range or _auto_sample_range(diagrams)
+    sample_range = cfg.fixed_sample_range or cfg.sample_range or _auto_sample_range(diagrams)
 
     prior = clutter = None
     sigma_info = None

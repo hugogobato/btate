@@ -219,3 +219,91 @@ def fundamental_floor(ref_mc, ref_clean) -> float:
     if denom <= 1e-12:
         return float("nan")
     return float(1.0 - float(np.max(np.abs(mc))) / denom)
+
+
+# --------------------------------------------------------------------------- #
+# Displacement diagnostics (Research_Plan Phase 5.5, Task 5.5.1)
+# --------------------------------------------------------------------------- #
+# Phase 5 showed the whole `cov_sim_clean = 0` failure lives at the silhouette
+# apex, and is driven by the signal loop's death-time collapse under interior
+# clutter.  The L2 attenuation ratio the project tracked for months averages
+# this away and reads a benign ~0.8.  These metrics score the displacement
+# directly, in t-units (range-invariant) rather than grid indices.
+
+
+def apex_location(psi, grid):
+    """Filtration-parameter location of the absolute apex of ``psi(t)``.
+
+    Returns ``grid[argmax |psi|]`` in *t*-units, not a grid index — so the
+    metric is comparable across filtrations with different scales.
+    """
+    psi = np.asarray(psi, dtype=float)
+    grid = np.asarray(grid, dtype=float)
+    if psi.size == 0:
+        return float("nan")
+    return float(grid[int(np.argmax(np.abs(psi)))])
+
+
+def apex_shift(psi_a, psi_b, grid):
+    """Signed apex shift ``t_apex(a) - t_apex(b)`` in filtration-parameter units.
+
+    Negative when ``psi_a`` is displaced leftward relative to ``psi_b`` (the
+    clutter direction found in Phase 5).  Always in *t*-units.
+    """
+    return apex_location(psi_a, grid) - apex_location(psi_b, grid)
+
+
+def apex_floor(psi_noisy, psi_clean, grid):
+    """Apex-anchored floor ``F_apex = 1 - psi_noisy[argmax|psi_clean|] / psi_clean[argmax|psi_clean|]``.
+
+    Unlike :func:`fundamental_floor` (which uses the *sup-norm* of each curve,
+    i.e. peak-to-peak), this is pinned to the *clean* apex location.
+    ``F_apex ≈ 1`` means the noisy curve has essentially zero signal at the
+    location where the clean effect peaks — the apex has been displaced, not
+    just attenuated.  ``F_apex = 0`` means the noisy curve preserves the clean
+    peak value at the correct location.
+
+    This is the metric that Phase 5's probe showed captures the failure: while
+    ``F`` (sup-norm) reads 0.61–0.87 (amplitude), ``F_apex`` reads 0.95–1.00
+    (location) on the low-SNR DGP.  Score ``F_apex`` alongside ``F`` in every
+    decision row.
+    """
+    psi_noisy = np.asarray(psi_noisy, dtype=float)
+    psi_clean = np.asarray(psi_clean, dtype=float)
+    grid = np.asarray(grid, dtype=float)
+    j = int(np.argmax(np.abs(psi_clean)))
+    denom = float(psi_clean[j])
+    if abs(denom) <= 1e-12:
+        return float("nan")
+    return float(1.0 - float(psi_noisy[j]) / denom)
+
+
+def death_recovery(d_post, d_obs, d_clean):
+    """Normalized death-time recovery ratio.
+
+    ``death_recovery = (d_post - d_clean) / (d_obs - d_clean)`` when
+    ``d_obs != d_clean`` (so 1.0 = no correction, 0.0 = full correction).  An
+    alternative convention (used in Task 5.5.3) is
+    ``death_recovery_ratio = (d_post - d_obs) / (d_clean - d_obs)`` which is
+    0 = no correction, 1 = full correction.  Both are provided.
+
+    Parameters
+    ----------
+    d_post : float
+        Death coordinate of the signal feature in the posterior / corrected diagram.
+    d_obs : float
+        Death coordinate of the signal feature in the observed diagram.
+    d_clean : float
+        Death coordinate of the signal feature in the clean diagram.
+
+    Returns
+    -------
+    dict with ``death_recovery_frac`` (=(d_obs-d_clean)/d_clean, the Phase 5.5
+    metric) and ``death_recovery_ratio`` (=(d_post-d_obs)/(d_clean-d_obs), the
+    Task 5.5.3 correction metric).
+    """
+    d_post, d_obs, d_clean = float(d_post), float(d_obs), float(d_clean)
+    frac = (d_obs - d_clean) / d_clean if abs(d_clean) > 1e-12 else float("nan")
+    gap = d_clean - d_obs
+    ratio = (d_post - d_obs) / gap if abs(gap) > 1e-12 else float("nan")
+    return {"death_recovery_frac": frac, "death_recovery_ratio": ratio}

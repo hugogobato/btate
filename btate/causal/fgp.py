@@ -16,6 +16,14 @@ from btate.embeddings.aggregation import summarize_posterior_functions
 from btate.embeddings.reduction import FPCAModel, fit_fpca
 
 
+#: Capability flag.  ``True`` once :meth:`_BayesianLinearFit.draw_coefficients`
+#: uses the symmetrized, eigenvalue-clipped factorization, which makes posterior
+#: draws a deterministic function of the covariance rather than of BLAS
+#: rounding.  Downstream runners check this to decide whether an installed
+#: (older) copy of the package needs the compatibility patch.
+DETERMINISTIC_COEFFICIENT_DRAWS = True
+
+
 def _as_rng(random_state=None) -> np.random.Generator:
     if isinstance(random_state, np.random.Generator):
         return random_state
@@ -175,8 +183,30 @@ class _BayesianLinearFit:
     scale_hat: float = float("nan")
 
     def draw_coefficients(self, n_draws: int, rng: np.random.Generator) -> np.ndarray:
+        """Draw coefficients via a symmetrized, eigenvalue-clipped factor.
+
+        ``coef_cov`` is assembled from products of kernel matrices (and, under
+        ``posterior_scale="godambe"``, from a sandwich ``A^{-1} B A^{-1}``), so
+        it is symmetric in exact arithmetic but routinely comes back with a
+        small asymmetry and slightly negative trailing eigenvalues.  Handing
+        that to ``rng.multivariate_normal`` triggers its
+        "covariance is not symmetric positive-semidefinite" warning and, worse,
+        makes the draws depend on BLAS-level rounding: on a near-singular
+        matrix the SVD it falls back to can return different eigenvector signs
+        under a different thread count, so the same seed produced materially
+        different posterior bands in a worker process than in the parent.
+
+        Symmetrizing and clipping explicitly gives the same distribution with a
+        factorization that is a deterministic function of the input, which is
+        what makes serial and parallel runs agree for a fixed seed.
+        """
         cov = self.posterior_scale * self.coef_cov + self.jitter * np.eye(self.coef_cov.shape[0])
-        return rng.multivariate_normal(self.coef_mean, cov, size=int(n_draws))
+        cov = 0.5 * (cov + cov.T)
+        eigenvalues, eigenvectors = np.linalg.eigh(cov)
+        eigenvalues = np.clip(eigenvalues, 0.0, None)
+        factor = eigenvectors * np.sqrt(eigenvalues)
+        noise = rng.standard_normal(size=(int(n_draws), cov.shape[0]))
+        return self.coef_mean + noise @ factor.T
 
     def predict_mean(self, features: np.ndarray) -> np.ndarray:
         return features @ self.coef_mean

@@ -32,6 +32,33 @@ def rmse(estimate, truth) -> float:
     return float(np.sqrt(np.mean((e - t) ** 2)))
 
 
+def nrmse(estimate, truth) -> float:
+    """RMSE normalized by the sup-norm of ``truth`` (a unitless error share).
+
+    ``nan`` when the reference curve is numerically zero, so a degenerate cell
+    cannot silently report a finite normalized error.
+    """
+    t = np.asarray(truth, dtype=float)
+    scale = float(np.max(np.abs(t)))
+    if not np.isfinite(scale) or scale <= 1e-12:
+        return float("nan")
+    return float(rmse(estimate, truth) / scale)
+
+
+def integrated_abs_error(estimate, truth, tseq) -> float:
+    """Grid-averaged integrated absolute error ``\\int|e-t| dt / (t1 - t0)``.
+
+    Grid-averaging keeps the number comparable with :func:`rmse` and
+    :func:`max_abs_error` (all three are in curve units), unlike the raw
+    :func:`l1_distance`, which scales with the width of the filtration domain.
+    """
+    tseq = np.asarray(tseq, dtype=float)
+    span = tseq[-1] - tseq[0]
+    if not np.isfinite(span) or abs(span) <= 1e-12:
+        return float("nan")
+    return float(l1_distance(estimate, truth, tseq) / span)
+
+
 def bias(estimate, truth) -> float:
     """Mean signed error (pointwise) between an estimate and the truth."""
     e = np.asarray(estimate, dtype=float)
@@ -105,6 +132,142 @@ def interval_width(lower, upper, tseq=None) -> float:
     tseq = np.asarray(tseq, dtype=float)
     span = tseq[-1] - tseq[0]
     return float(numerical_integration(width, tseq) / span)
+
+
+def interval_score(lower, upper, truth, alpha: float = 0.05) -> float:
+    """Grid-averaged Gneiting--Raftery interval score (negatively oriented).
+
+    ``(u - l) + (2/alpha)(l - y)_+ + (2/alpha)(y - u)_+`` averaged over the
+    grid.  Lower is better; it is the proper scoring rule that trades band width
+    against miscoverage, so a method cannot win by reporting an infinitely wide
+    band or by reporting a needle-thin one.
+    """
+    lower = np.asarray(lower, dtype=float)
+    upper = np.asarray(upper, dtype=float)
+    truth = np.asarray(truth, dtype=float)
+    if not (0.0 < alpha < 1.0):
+        raise ValueError("alpha must be in (0, 1)")
+    below = np.maximum(lower - truth, 0.0)
+    above = np.maximum(truth - upper, 0.0)
+    return float(np.mean((upper - lower) + (2.0 / alpha) * (below + above)))
+
+
+# --------------------------------------------------------------------------- #
+# Target-labelled scoring (Phase 6)
+# --------------------------------------------------------------------------- #
+# Phase 4.5 established the project rule that no coverage/error number may be
+# reported without naming the estimand it is scored against (docs/phase4_5_claims
+# _memo.md, Decision 4).  The helpers below make that rule mechanical: every
+# column they emit carries a ``_<target>`` suffix, and an unlabelled call raises.
+
+VALID_TARGETS = ("clean", "noisy")
+
+
+def require_target_label(target: str) -> str:
+    """Validate an estimand label, raising when it is missing or unknown.
+
+    Guards :func:`curve_error_columns` / :func:`band_coverage_columns` so a
+    coverage number can never be emitted without saying whether its target is
+    ``psi_clean_alpha`` or ``psi_noisy_alpha``.
+    """
+    if not isinstance(target, str) or not target:
+        raise ValueError(
+            "a coverage/error target label is required; "
+            f"choose one of {VALID_TARGETS}"
+        )
+    if target not in VALID_TARGETS:
+        raise ValueError(
+            f"unknown target label {target!r}; choose one of {VALID_TARGETS}"
+        )
+    return target
+
+
+def curve_error_columns(estimate, truth, tseq, *, target: str,
+                        prefix: str = "") -> dict:
+    """Whole-curve accuracy columns for one estimate against one named target.
+
+    Emits ``rmse``, ``nrmse``, ``bias`` (mean signed), ``int_bias`` (integrated
+    signed), ``int_abs_err``, ``max_abs_err`` and ``apex_abs_err`` /
+    ``apex_signed_err`` (error at ``argmax|truth|``), each suffixed by
+    ``_<target>``.
+    """
+    require_target_label(target)
+    pre = f"{prefix}_" if prefix else ""
+    suf = f"_{target}"
+    return {
+        f"{pre}rmse{suf}": rmse(estimate, truth),
+        f"{pre}nrmse{suf}": nrmse(estimate, truth),
+        f"{pre}bias{suf}": bias(estimate, truth),
+        f"{pre}int_bias{suf}": integrated_bias(estimate, truth, tseq),
+        f"{pre}int_abs_err{suf}": integrated_abs_error(estimate, truth, tseq),
+        f"{pre}max_abs_err{suf}": max_abs_error(estimate, truth),
+        f"{pre}apex_signed_err{suf}": peak_signed_bias(estimate, truth),
+        f"{pre}apex_abs_err{suf}": peak_abs_error(estimate, truth),
+    }
+
+
+def band_coverage_columns(pointwise_lower, pointwise_upper,
+                          simultaneous_lower, simultaneous_upper,
+                          truth, tseq, *, target: str, prefix: str = "",
+                          alpha: float = 0.05, peak_window: int = 6) -> dict:
+    """Coverage / width / interval-score columns against one named target.
+
+    The pointwise columns summarize the *pointwise* interval; the ``cov_sim``
+    column is the curve-level indicator that the whole target curve lies inside
+    the **simultaneous** band (average it over Monte-Carlo replicates to get a
+    calibration rate — a single dataset's ``cov_pointwise_mean`` is not that).
+    """
+    require_target_label(target)
+    pre = f"{prefix}_" if prefix else ""
+    suf = f"_{target}"
+    truth = np.asarray(truth, dtype=float)
+    pw_lo = np.asarray(pointwise_lower, dtype=float)
+    pw_hi = np.asarray(pointwise_upper, dtype=float)
+    sim_lo = np.asarray(simultaneous_lower, dtype=float)
+    sim_hi = np.asarray(simultaneous_upper, dtype=float)
+    inside = (truth >= pw_lo) & (truth <= pw_hi)
+    j = peak_index(truth)
+    sl = _peak_window(truth, peak_window)
+    return {
+        f"{pre}cov_pointwise_mean{suf}": float(np.mean(inside)),
+        f"{pre}cov_pointwise_min{suf}": float(np.min(inside.astype(float))),
+        f"{pre}cov_apex{suf}": float(inside[j]),
+        f"{pre}cov_peak_pointwise{suf}": peak_pointwise_coverage(
+            pw_lo, pw_hi, truth, window=peak_window),
+        f"{pre}cov_peak_localized{suf}": peak_localized_coverage(
+            sim_lo, sim_hi, truth, window=peak_window),
+        f"{pre}cov_sim{suf}": simultaneous_coverage(sim_lo, sim_hi, truth),
+        f"{pre}width_pointwise{suf}": interval_width(pw_lo, pw_hi, tseq),
+        f"{pre}width_sim{suf}": interval_width(sim_lo, sim_hi, tseq),
+        f"{pre}width_sim_apex{suf}": float(sim_hi[j] - sim_lo[j]),
+        f"{pre}width_sim_peak{suf}": float(np.mean(sim_hi[sl] - sim_lo[sl])),
+        f"{pre}interval_score_pointwise{suf}": interval_score(
+            pw_lo, pw_hi, truth, alpha=alpha),
+        f"{pre}interval_score_sim{suf}": interval_score(
+            sim_lo, sim_hi, truth, alpha=alpha),
+    }
+
+
+def coverage_rate_with_ci(indicators, alpha: float = 0.05) -> dict:
+    """Monte-Carlo coverage rate with an exact Clopper--Pearson interval.
+
+    ``indicators`` are the per-replicate 0/1 simultaneous-coverage indicators.
+    Non-finite entries (failed replicates) are dropped and counted separately so
+    a crash cannot be silently scored as a miss.
+    """
+    arr = np.asarray(indicators, dtype=float).ravel()
+    finite = arr[np.isfinite(arr)]
+    n = int(finite.size)
+    k = int(np.sum(finite > 0.5))
+    lo, hi = clopper_pearson(k, n, alpha=alpha)
+    return {
+        "n_replicates": n,
+        "n_dropped": int(arr.size - n),
+        "n_covered": k,
+        "coverage": float(k / n) if n else float("nan"),
+        "cp_lower": lo,
+        "cp_upper": hi,
+    }
 
 
 # --------------------------------------------------------------------------- #

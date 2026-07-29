@@ -10,8 +10,18 @@ For every ``(noise, replicate, filtration)`` cell it reports:
 
 * the apex-anchored floor between the observed and clean causal-effect curves;
 * the relative displacement of the observed effect apex;
-* relative error in the death coordinate of the most-persistent H1 feature; and
+* relative error in the death coordinate of the most-persistent H1 feature;
+* whole-curve ``within_filtration_*`` error between the observed effect curve
+  and *its own filtration's* clean effect curve; and
 * the exact contaminating-point fraction implied by the synthetic DGP.
+
+**The ``within_filtration_*`` columns are within-representation only.**  A DTM
+row compares DTM-observed against DTM-clean, whose clean effect amplitude and
+filtration coordinates differ from the Alpha ones (clean Alpha peak ~0.170 vs
+clean DTM-k15 peak ~0.296 on this DGP).  A small DTM ``within_filtration_rmse``
+therefore says nothing about recovery of the clean *Alpha* estimand; only the
+explicitly-fitted bridge in :mod:`btate.benchmarks.measurement_error_uq` scores
+that, under ``clean_alpha_*`` names.
 
 ``alpha`` is the naive representation and ``dtm_rips_k15`` is the
 pre-registered repaired representation.  Other DTM neighbourhoods are retained
@@ -28,7 +38,12 @@ from btate.benchmarks.dtm import h1_diagram_filtration, top_feature_death
 from btate.benchmarks.metrics import (
     apex_floor,
     apex_location,
+    clopper_pearson,
     fundamental_floor,
+    integrated_abs_error,
+    max_abs_error,
+    nrmse,
+    rmse,
 )
 from btate.benchmarks.synthetic import (
     SyntheticConfig,
@@ -304,12 +319,29 @@ def evaluate_transition_rep(
                 np.abs(relative_death_errors).tolist()
             ),
             "n_valid_death_pairs": len(relative_death_errors),
+            # Whole-curve error, observed vs clean *within this filtration*.
+            # Never a clean-Alpha score for a DTM row (see the module docstring).
+            "within_filtration_rmse": rmse(psi_observed, psi_clean),
+            "within_filtration_nrmse": nrmse(psi_observed, psi_clean),
+            "within_filtration_max_abs_error": max_abs_error(
+                psi_observed, psi_clean
+            ),
+            "within_filtration_integrated_abs_error": integrated_abs_error(
+                psi_observed, psi_clean, grid
+            ),
             # Metric collapse checks.  These must be exactly zero up to
             # floating-point error, independently of the DGP.
             "collapse_F_apex": apex_floor(psi_clean, psi_clean, grid),
             "collapse_apex_shift": float(
                 apex_location(psi_clean, grid)
                 - apex_location(psi_clean, grid)
+            ),
+            "collapse_within_filtration_rmse": rmse(psi_clean, psi_clean),
+            "collapse_within_filtration_max_abs_error": max_abs_error(
+                psi_clean, psi_clean
+            ),
+            "collapse_within_filtration_integrated_abs_error": (
+                integrated_abs_error(psi_clean, psi_clean, grid)
             ),
         }
         rows.append(row)
@@ -357,7 +389,9 @@ def run_transition_sweep(
     if raw.empty:
         return raw
 
-    collapse_columns = ["collapse_F_apex", "collapse_apex_shift"]
+    collapse_columns = [
+        column for column in raw.columns if column.startswith("collapse_")
+    ]
     collapse_max = raw[collapse_columns].abs().to_numpy().max()
     if not np.isfinite(collapse_max) or collapse_max > 1e-10:
         raise RuntimeError(
@@ -402,6 +436,10 @@ def summarize_transition_sweep(
         "contamination_fraction",
         "clean_effect_peak",
         "observed_effect_peak",
+        "within_filtration_rmse",
+        "within_filtration_nrmse",
+        "within_filtration_max_abs_error",
+        "within_filtration_integrated_abs_error",
         "collapse_F_apex",
         "collapse_apex_shift",
     ]
@@ -445,3 +483,75 @@ def summarize_transition_sweep(
     return grouped.sort_values(
         ["noise_level", "filtration"]
     ).reset_index(drop=True), transition
+
+
+def replicate_gate_table(
+    raw: pd.DataFrame,
+    *,
+    naive_filtration: str = NAIVE_FILTRATION,
+    repaired_filtration: str = REPAIRED_FILTRATION,
+    naive_floor_interval: tuple[float, float] = (0.4, 0.8),
+    repaired_floor_max: float = 0.3,
+    alpha: float = 0.05,
+) -> pd.DataFrame:
+    """Per-replicate pass proportions for the pre-registered transition gates.
+
+    :func:`summarize_transition_sweep` applies the gates to the *mean* ``F_apex``
+    across replicates, which hides how often an individual replicate actually
+    satisfies them.  This table applies both gates *within each replicate*, then
+    reports the pass count, proportion and an exact Clopper--Pearson interval, so
+    a cell that passes on the mean but only in half the replicates cannot be read
+    as a stable transition point.
+
+    The registered gates are kept visible and unchanged:
+    ``F_apex_alpha in [0.4, 0.8]`` and ``F_apex_repaired < 0.3``.
+    """
+    if raw.empty:
+        return pd.DataFrame()
+    required = {"noise_level", "rep", "filtration", "F_apex"}
+    missing = required - set(raw.columns)
+    if missing:
+        raise ValueError(f"raw transition frame is missing {sorted(missing)}")
+
+    wide = raw.pivot_table(
+        index=["noise_level", "rep"], columns="filtration", values="F_apex"
+    )
+    for name in (naive_filtration, repaired_filtration):
+        if name not in wide.columns:
+            raise ValueError(
+                f"filtration {name!r} is absent from the sweep; cannot score the "
+                "registered gate"
+            )
+    lo, hi = map(float, naive_floor_interval)
+    naive_pass = wide[naive_filtration].between(lo, hi, inclusive="both")
+    repaired_pass = wide[repaired_filtration] < float(repaired_floor_max)
+    flags = pd.DataFrame(
+        {
+            "naive_pass": naive_pass,
+            "repaired_pass": repaired_pass,
+            "joint_pass": naive_pass & repaired_pass,
+        }
+    )
+
+    rows: list[dict] = []
+    for noise, cell in flags.groupby(level="noise_level"):
+        n = int(len(cell))
+        row: dict[str, float | int | str] = {
+            "noise_level": float(noise),
+            "n_reps": n,
+            "naive_filtration": naive_filtration,
+            "repaired_filtration": repaired_filtration,
+            "naive_floor_lo": lo,
+            "naive_floor_hi": hi,
+            "repaired_floor_max": float(repaired_floor_max),
+        }
+        for column in ("naive_pass", "repaired_pass", "joint_pass"):
+            k = int(cell[column].sum())
+            cp_lo, cp_hi = clopper_pearson(k, n, alpha=alpha)
+            stem = column.replace("_pass", "")
+            row[f"{stem}_n_pass"] = k
+            row[f"{stem}_prop"] = float(k / n) if n else float("nan")
+            row[f"{stem}_cp_lower"] = cp_lo
+            row[f"{stem}_cp_upper"] = cp_hi
+        rows.append(row)
+    return pd.DataFrame(rows).sort_values("noise_level").reset_index(drop=True)

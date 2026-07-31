@@ -847,6 +847,14 @@ class ObservedBundle:
 
     Deliberately contains **no** clean array of any kind.  A method that needs
     something absent from this bundle is, by construction, an oracle method.
+
+    ``diagrams_alpha`` carries the **observed** (contaminated) Alpha H1
+    diagrams in birth--death coordinates of the arm each subject was assigned
+    to, NaN-padded to ``(n, max_k, 2)`` with the true sizes in
+    ``diagram_alpha_sizes``.  They are observed data, exactly like
+    ``phi_alpha``; Phase 6.25 adds them so the topological measurement-error
+    model (``btate.benchmarks.controlled_comparisons``) can operate on the
+    diagram level instead of the silhouette level.
     """
 
     phi_alpha: np.ndarray           # (n, m) contaminated Alpha silhouettes
@@ -855,6 +863,8 @@ class ObservedBundle:
     X: np.ndarray
     pi_hat: np.ndarray
     grid: np.ndarray
+    diagrams_alpha: np.ndarray | None = None        # (n, max_k, 2) b-d, NaN-padded
+    diagram_alpha_sizes: np.ndarray | None = None   # (n,) feature counts
 
 
 @dataclass(frozen=True)
@@ -879,6 +889,7 @@ def build_replicate(cfg: MEUQConfig, grid: GridSpec,
     n = ds.clouds.shape[0]
 
     phi_alpha, phi_dtm, phi_clean = [], [], []
+    diagrams_obs = []
     clean_arms = np.zeros((n, 2, grid.resolution), dtype=float)
     noisy_arms = np.zeros((n, 2, grid.resolution), dtype=float)
     for i in range(n):
@@ -893,14 +904,24 @@ def build_replicate(cfg: MEUQConfig, grid: GridSpec,
         a = int(ds.A[i])
         phi_alpha.append(noisy_arms[i, a])
         phi_clean.append(clean_arms[i, a])
+        diagrams_obs.append(alpha_diagram(noisy_clouds[a]))
         if cfg.use_dtm_feature:
             phi_dtm.append(grid.dtm_curve(noisy_clouds[a], cfg.dtm_k))
+
+    max_k = max((d.shape[0] for d in diagrams_obs), default=0)
+    padded_diagrams = np.full((n, max_k, 2), np.nan, dtype=float)
+    diagram_sizes = np.zeros(n, dtype=int)
+    for i, d in enumerate(diagrams_obs):
+        diagram_sizes[i] = d.shape[0]
+        if d.shape[0]:
+            padded_diagrams[i, : d.shape[0]] = d
 
     observed = ObservedBundle(
         phi_alpha=np.stack(phi_alpha),
         phi_dtm=np.stack(phi_dtm) if phi_dtm else None,
         A=np.asarray(ds.A, dtype=int), X=np.asarray(ds.X, dtype=float),
         pi_hat=np.asarray(ds.pi, dtype=float), grid=grid.grid,
+        diagrams_alpha=padded_diagrams, diagram_alpha_sizes=diagram_sizes,
     )
     oracle = OracleBundle(
         phi_clean_alpha=np.stack(phi_clean),

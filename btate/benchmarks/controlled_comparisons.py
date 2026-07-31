@@ -95,7 +95,6 @@ import numpy as np
 from btate.benchmarks.measurement_error_uq import (
     MEUQConfig,
     MethodResult,
-    OracleBundle,
     _aipw_result,
     _fgp_estimator,
     _noise_key,
@@ -115,7 +114,6 @@ from btate.benchmarks.measurement_error_uq import (
     score_method,
     silhouette_on_grid,
 )
-from btate.benchmarks.metrics import coverage_rate_with_ci
 from btate.benchmarks.synthetic import generate_synthetic_dataset
 from btate.embeddings.silhouette import weighted_silhouette
 from btate.topo_posterior.adapters import bd_to_bp, bp_to_bd

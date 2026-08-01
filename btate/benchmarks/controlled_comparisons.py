@@ -15,9 +15,9 @@ sample and evaluation harness:
 2. *"The Gaussian bridge operates on ``R^96`` and knows nothing about persistence
    diagrams"* - currently a fair criticism with no measurement attached.  This
    phase measures, per posterior draw of every arm that emits latent clean
-   curves, the fraction of draws that violate the **valid-silhouette cone**
-   (C1-C4, necessary conditions read off
-   ``btate/embeddings/silhouette.py:117``), and scores the **cone-projected**
+   curves, the fraction of draws that violate the **valid-silhouette
+   polyhedron** (C1-C3, unconditional necessary conditions read off
+   ``btate/embeddings/silhouette.py:117``), and scores the **polyhedron-projected**
    arms (``*_proj``) to decide whether enforcing validity helps, hurts, or does
    nothing.
 
@@ -39,40 +39,36 @@ that M4 uses (``nested_posterior_tate``).  This carries an explicit ``D | D~``
 uncertainty term - exactly the ingredient Phase 6 identified as necessary.
 
 Fairness: M4's bridge is fitted on the independent paired calibration sample;
-M6's prior, clutter and ``sigma_DYO`` are fitted on the **same** calibration
-sample (its observed diagrams, pooled across arms without the treatment label),
-with ``sigma_DYO`` selected by the Phase-4.25 empirical-Bayes marginal
-likelihood re-scored on a subject-disjoint hold-out split of that sample, then
-frozen.  The bridge additionally consumes the paired clean curves (its own
-model's requirement); M6's model is a diagram-space PPP and consumes only
-observed diagrams.  The selection rule is registered here and reported in every
-cell's provenance.
+M6 uses the **same paired clean/observed information**, pooled across arms
+without the treatment label.  Its prior is elicited from clean diagrams, its
+clutter template from observed diagrams, and the prior complexity, clutter
+scale, ``alpha`` and ``sigma_DYO`` are selected by the conditional predictive
+log score of held-out clean diagrams given their paired observed diagrams.
+Subjects, rather than curves, define the split.  The selected structure is then
+refitted on the full calibration sample and frozen.  This is what makes M6 a
+validation-calibrated clean-target model rather than a marginal model for the
+contaminated diagrams.
 
-The valid-silhouette cone (C1-C4)
----------------------------------
+The valid-silhouette polyhedron (C1-C3)
+---------------------------------------
 Under the frozen grid with spacing ``Delta``, every genuine power-weighted
 silhouette (``weighted_silhouette``, ``btate/embeddings/silhouette.py:117``)
 satisfies, with ``L = sqrt(2)`` the implementation's Lipschitz constant:
 
 * **C1** non-negativity: ``phi(t) >= 0``;
 * **C2** Lipschitz bound: ``|phi_{i+1} - phi_i| <= L * Delta``;
-* **C3** height bound: ``phi(t) <= L * (max persistence) / 2``, which the
-  frozen grid endpoint bounds by ``L * grid_upper / 2``;
-* **C4** support: ``phi`` vanishes at the grid endpoints.
+* **C3** left support: ``phi(0) = 0`` because Alpha births are non-negative.
 
-C1-C4 are **necessary, not sufficient** (the achievable set is the non-convex
-image of diagram space under the silhouette map; the cone is a convex outer
-approximation of it), so a violation is a sound certificate of invalidity while
-satisfaction proves nothing.  The measured violation rate is therefore a
-**lower bound** on how often the bridge leaves the valid set.
+C1-C3 are **necessary, not sufficient** (the achievable set is the non-convex
+image of diagram space under the silhouette map; the polyhedron is a convex
+outer approximation), so a violation is a sound certificate of invalidity
+while satisfaction proves nothing.  A finite evaluation-grid endpoint does
+not bound diagram persistence, so neither a grid-derived height cap nor zero at
+the right endpoint is imposed.  Those formerly registered conditions rejected
+genuine silhouettes of features whose deaths extend beyond the grid.
 
-M6 draws are silhouettes of sampled diagrams, so they satisfy C1 and C2 for
-*any* diagram.  They satisfy C3 and C4 whenever every sampled feature lies
-inside the grid; the posterior intensity's Gaussian tails are unbounded, so a
-rare feature sampled beyond ``grid_upper`` can legitimately trip C3/C4.  The
-violation columns therefore carry a per-draw attribution check for M6
-(``max_sampled_death``), so a non-zero M6 rate is a statement about the
-posterior tails, not a falsification of the diagnostic.
+M6 draws are silhouettes of sampled diagrams and therefore satisfy C1-C3 for
+every draw.  Any M6 violation falsifies the diagnostic or the implementation.
 
 New seed streams
 ----------------
@@ -85,7 +81,9 @@ projection is the *only* difference between an arm and its ``_proj`` version.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import pickle
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -117,7 +115,6 @@ from btate.benchmarks.measurement_error_uq import (
 from btate.benchmarks.synthetic import generate_synthetic_dataset
 from btate.embeddings.silhouette import weighted_silhouette
 from btate.topo_posterior.adapters import bd_to_bp, bp_to_bd
-from btate.topo_posterior.eb import select_sigma_dyo
 from btate.topo_posterior.elicitation import elicit_prior_clutter
 from btate.topo_posterior.sampler import PosteriorDiagramSampler
 
@@ -130,16 +127,21 @@ P625_METHODS = (
     "bayes_causal_only",
     "me_bayes_bridge",
     "me_freq_mi",
-    "me_bayes_bridge_proj",       # M4-proj: M4 draws projected onto the cone
-    "me_freq_mi_proj",            # M5-proj: M5 draws projected onto the cone
+    "me_bayes_bridge_proj",       # M4-proj: projected onto the polyhedron
+    "me_freq_mi_proj",            # M5-proj: projected onto the polyhedron
     "me_topo_posterior",          # M6: topological posterior over diagrams
     "me_topo_point",              # M6-point: AIPW on the posterior-mean curve
-    "me_topo_posterior_proj",     # M6-proj: M6 draws projected onto the cone
+    "me_topo_posterior_proj",     # M6-proj: projected onto the polyhedron
 )
 DTM_P625_METHODS = ("me_bayes_bridge_dtm", "me_freq_mi_dtm")
 
+P625_CACHE_VERSION = 3
+M6_ALPHA_GRID = (0.50, 0.75, 1.00)
+M6_CLUTTER_SCALE_GRID = (0.50, 1.00, 2.00)
+M6_SIGMA_MULTIPLIER_GRID = tuple(np.geomspace(0.02, 20.0, 9))
+
 # --------------------------------------------------------------------------- #
-# The valid-silhouette cone (Task 6.25.2)
+# The unconditional valid-silhouette polyhedron (Task 6.25.2)
 # --------------------------------------------------------------------------- #
 def derive_lipschitz_constant() -> float:
     """The silhouette Lipschitz constant, re-derived from the implementation.
@@ -164,14 +166,13 @@ def derive_lipschitz_constant() -> float:
 
 
 @dataclass(frozen=True)
-class SilhouetteCone:
-    """C1-C4 outer approximation of the valid-silhouette set on one grid."""
+class SilhouettePolyhedron:
+    """C1-C3 outer approximation of the valid-silhouette set on one grid."""
 
     grid: np.ndarray
     delta: float
     lipschitz_constant: float
-    slope: float       # L * delta          (C2)
-    height_bound: float  # L * grid_upper / 2  (C3, in-grid features)
+    slope: float
     grid_upper: float
 
     def to_dict(self) -> dict:
@@ -179,50 +180,66 @@ class SilhouetteCone:
             "delta": float(self.delta),
             "lipschitz_constant": float(self.lipschitz_constant),
             "slope": float(self.slope),
-            "height_bound": float(self.height_bound),
             "grid_upper": float(self.grid_upper),
+            "constraints": [
+                "C1_nonnegative",
+                "C2_sqrt2_lipschitz",
+                "C3_left_endpoint_zero",
+            ],
         }
 
 
-def silhouette_cone(grid, lipschitz_constant: float | None = None) -> SilhouetteCone:
-    """The C1-C4 cone for a frozen grid.
+def silhouette_polyhedron(
+    grid, lipschitz_constant: float | None = None,
+) -> SilhouettePolyhedron:
+    """Return the unconditional C1-C3 outer approximation on ``grid``.
 
-    ``max_persistence`` is bounded by ``grid_upper`` (births are ``>= 0`` and
-    the grid starts at ``0``), so ``C3`` uses ``L * grid_upper / 2`` - the
-    plan's ``~0.600`` constant on the frozen ``(0, 0.848)`` grid.  This is a
-    necessary condition only for features that lie inside the grid; the
-    diagnostics report the M6 sampled-feature attribution separately.
+    The right grid endpoint is an evaluation boundary, not a support bound on
+    persistence diagrams.  The former height cap and right-endpoint pin are
+    therefore deliberately absent.
     """
     grid = np.asarray(grid, dtype=float).ravel()
     if grid.size < 2:
-        raise ValueError("a cone needs a grid of at least two points")
+        raise ValueError("a silhouette polyhedron needs at least two grid points")
     spacings = np.diff(grid)
+    if np.any(spacings <= 0.0):
+        raise ValueError("the silhouette polyhedron requires a strictly increasing grid")
     if not np.allclose(spacings, spacings[0]):
-        raise ValueError("the cone requires a uniform grid")
+        raise ValueError("the silhouette polyhedron requires a uniform grid")
+    if not np.isclose(grid[0], 0.0):
+        raise ValueError("C3 requires a grid whose left endpoint is zero")
     delta = float(spacings[0])
     upper = float(grid[-1])
     L = float(np.sqrt(2.0) if lipschitz_constant is None else lipschitz_constant)
     if L <= 0.0 or not np.isfinite(L):
         raise ValueError("lipschitz_constant must be positive and finite")
-    return SilhouetteCone(
+    return SilhouettePolyhedron(
         grid=grid, delta=delta, lipschitz_constant=L, slope=L * delta,
-        height_bound=L * upper / 2.0, grid_upper=upper,
+        grid_upper=upper,
     )
 
 
-def cone_violation_stats(draws, cone: SilhouetteCone, tol: float = 1e-9) -> dict:
-    """Per-draw violation rates of C1-C4 plus worst violation magnitudes.
+# Compatibility aliases for the registered arm names and older notebooks.
+SilhouetteCone = SilhouettePolyhedron
 
-    ``draws`` has shape ``(S, n, m)`` (one curve per draw per subject).  A draw
-    counts as violating a condition when *any* grid point violates it, beyond a
-    small absolute tolerance (kept conservative so the reported rate remains a
-    *lower bound* on how often the arm leaves the valid set).  Magnitudes are
-    reported over violating draws only: for C2 in units of ``delta``, for
-    C1/C3/C4 in absolute silhouette units.
-    """
+
+def silhouette_cone(
+    grid, lipschitz_constant: float | None = None,
+) -> SilhouettePolyhedron:
+    return silhouette_polyhedron(grid, lipschitz_constant=lipschitz_constant)
+
+
+def cone_violation_stats(
+    draws, cone: SilhouettePolyhedron, tol: float = 1e-9,
+) -> dict:
+    """Per-curve violation rates of C1-C3 plus worst magnitudes."""
     x = np.asarray(draws, dtype=float)
     if x.size == 0:
-        raise ValueError("need at least one curve to measure cone violations")
+        raise ValueError("need at least one curve to measure silhouette validity")
+    if np.any(~np.isfinite(x)):
+        raise ValueError("silhouette draws must be finite")
+    if x.ndim == 0 or x.shape[-1] != cone.grid.size:
+        raise ValueError("the last draw dimension must match the polyhedron grid")
     if x.ndim == 2:
         x = x[None, :, :]
     x = x.reshape(-1, cone.grid.size)
@@ -230,121 +247,113 @@ def cone_violation_stats(draws, cone: SilhouetteCone, tol: float = 1e-9) -> dict
 
     c1 = np.any(x < -tol, axis=1)
     c2 = np.any(np.abs(diffs) > cone.slope + tol, axis=1)
-    c3 = np.any(x > cone.height_bound + tol, axis=1)
-    c4 = (np.abs(x[:, 0]) > tol) | (np.abs(x[:, -1]) > tol)
-    any_ = c1 | c2 | c3 | c4
+    c3 = np.abs(x[:, 0]) > tol
+    any_ = c1 | c2 | c3
 
     out = {
-        "cone_viol_c1_rate": float(c1.mean()),
-        "cone_viol_c2_rate": float(c2.mean()),
-        "cone_viol_c3_rate": float(c3.mean()),
-        "cone_viol_c4_rate": float(c4.mean()),
-        "cone_viol_any_rate": float(any_.mean()),
+        "viol_c1_rate": float(c1.mean()),
+        "viol_c2_rate": float(c2.mean()),
+        "viol_c3_rate": float(c3.mean()),
+        "viol_any_rate": float(any_.mean()),
+        "viol_c1_mag": float(-np.min(x[c1])) if c1.any() else 0.0,
+        "viol_c3_mag": float(np.max(np.abs(x[c3, 0]))) if c3.any() else 0.0,
     }
-    out["cone_viol_c1_mag"] = float(-np.min(x[c1])) if c1.any() else 0.0
-    if c2.any():
-        out["cone_viol_c2_mag_delta_units"] = float(
-            np.max(np.abs(diffs[c2]) - cone.slope) / cone.delta)
-    else:
-        out["cone_viol_c2_mag_delta_units"] = 0.0
-    out["cone_viol_c3_mag"] = (float(np.max(x[c3]) - cone.height_bound)
-                               if c3.any() else 0.0)
-    if c4.any():
-        out["cone_viol_c4_mag"] = float(max(
-            float(np.max(np.abs(x[c4, 0]))), float(np.max(np.abs(x[c4, -1])))))
-    else:
-        out["cone_viol_c4_mag"] = 0.0
+    out["viol_c2_mag_delta_units"] = (
+        float(np.max(np.abs(diffs[c2]) - cone.slope) / cone.delta)
+        if c2.any() else 0.0
+    )
     return out
 
 
-def project_to_cone(curves, cone: SilhouetteCone, max_sweeps: int = 4000,
-                    viol_tol: float = 1e-9) -> np.ndarray:
-    """Euclidean projection of each curve onto the C1-C4 cone.
+def project_to_cone(
+    curves, cone: SilhouettePolyhedron, max_sweeps: int = 4000,
+    viol_tol: float = 1e-9, update_tol: float = 1e-11,
+) -> np.ndarray:
+    """Euclidean projection onto the unconditional C1-C3 polyhedron.
 
-    The cone is a polyhedron ``{A x <= b}`` whose rows are box constraints
-    (one variable), endpoint pins (one variable) and Lipschitz constraints
-    (``x_{i+1} - x_i <= s``, two variables).  The projection is solved through
-    the dual by block-coordinate descent (Hildreth's row-action method with
-    Lagrange-multiplier tracking; without the multipliers the iterates stall at
-    a feasible-but-suboptimal point, which is why the multipliers are
-    maintained explicitly).  Blocks group constraints that act on disjoint
-    variables (the box constraints, and the Lipschitz pairs of each parity), so
-    every update is an exact line search, vectorised across the whole draw
-    batch.  The exact coordinate step for constraint ``j`` is
-
-    .. math:: \\lambda_j \\leftarrow \\max\\bigl(0,\\ \\lambda_j +
-        (a_j^T x - b_j)/\\|a_j\\|^2\\bigr),
-
-    which is evaluated as ``delta = max(resid, -lam_j)`` with ``resid`` the
-    (normalised) residual.  Convergence is geometric on these draw
-    distributions (constraint violations reach ``1e-11`` within ~2000 sweeps);
-    the sweep cap exists only for the pathological all-constraints-active case.
-    The result matches an independent SLSQP solve of the QP to ``1e-8`` in the
-    tests.  A point that already satisfies every constraint has all residuals
-    ``<= 0``, so it receives zero updates and comes back **bit-identical**; at
-    convergence the projection is idempotent to the feasibility tolerance.  No
-    randomness is involved, so results are bit-reproducible under a pinned BLAS
-    thread count.
+    Hildreth dual-coordinate updates are vectorised over curves.  Stopping
+    requires both primal feasibility and a small maximum dual-coordinate
+    update over a complete sweep.  Primal feasibility alone is insufficient
+    because a feasible intermediate iterate can still be nonoptimal.
     """
     arr = np.asarray(curves, dtype=float)
     shape = arr.shape
     m = cone.grid.size
     if arr.size == 0:
         return arr
+    if np.any(~np.isfinite(arr)):
+        raise ValueError("curves must be finite")
+    if arr.ndim == 0 or arr.shape[-1] != m:
+        raise ValueError("the last curve dimension must match the polyhedron grid")
     x = arr.reshape(-1, m).copy()
     B = x.shape[0]
     s = cone.slope
-    b = cone.height_bound
 
-    # Dual variables, one block per constraint family.
-    lam_low = np.zeros((B, m), dtype=float)      # -x_i <= 0
-    lam_high = np.zeros((B, m), dtype=float)     # x_i <= b_i (0 at endpoints)
-    lam_lip_pos = np.zeros((B, m - 1), dtype=float)  # x_{i+1} - x_i <= s
-    lam_lip_neg = np.zeros((B, m - 1), dtype=float)  # x_i - x_{i+1} <= s
+    initial_viol = max(
+        float(np.max(np.maximum(-x, 0.0))),
+        float(np.max(np.abs(x[:, 0]))),
+        float(np.max(np.maximum(np.abs(np.diff(x, axis=1)) - s, 0.0))),
+    )
+    if initial_viol <= viol_tol:
+        return arr.copy()
 
-    high_bound = np.full(m, b, dtype=float)
-    high_bound[0] = 0.0
-    high_bound[-1] = 0.0
+    lam_low = np.zeros((B, m), dtype=float)           # -x_i <= 0
+    lam_left = np.zeros(B, dtype=float)               # x_0 <= 0
+    lam_lip_pos = np.zeros((B, m - 1), dtype=float)   # x_{i+1} - x_i <= s
+    lam_lip_neg = np.zeros((B, m - 1), dtype=float)   # x_i - x_{i+1} <= s
+    even_p1 = np.arange(0, m - 1, 2)
+    odd_p1 = np.arange(1, m - 1, 2)
 
-    even_p1 = np.arange(0, m - 1, 2)    # pairs (0,1), (2,3), ...
-    odd_p1 = np.arange(1, m - 1, 2)     # pairs (1,2), (3,4), ...
+    converged = False
+    last_viol = float("inf")
+    last_update = float("inf")
+    for _ in range(int(max_sweeps)):
+        sweep_update = 0.0
 
-    for it in range(int(max_sweeps)):
-        # box lower: -x_i <= 0   (||a||^2 = 1)
         resid = -x
         delta = np.maximum(resid, -lam_low)
+        sweep_update = max(sweep_update, float(np.max(np.abs(delta))))
         lam_low += delta
         x += delta
-        # box upper: x_i <= b_i (interior b, endpoints pinned to 0)
-        resid = x - high_bound[None, :]
-        delta = np.maximum(resid, -lam_high)
-        lam_high += delta
-        x -= delta
+
+        resid = x[:, 0]
+        delta = np.maximum(resid, -lam_left)
+        sweep_update = max(sweep_update, float(np.max(np.abs(delta))))
+        lam_left += delta
+        x[:, 0] -= delta
+
         for p1 in (even_p1, odd_p1):
             p2 = p1 + 1
             resid = (x[:, p2] - x[:, p1] - s) / 2.0
             delta = np.maximum(resid, -lam_lip_pos[:, p1])
+            sweep_update = max(sweep_update, float(np.max(np.abs(delta))))
             lam_lip_pos[:, p1] += delta
             x[:, p2] -= delta
             x[:, p1] += delta
+
             resid = (x[:, p1] - x[:, p2] - s) / 2.0
             delta = np.maximum(resid, -lam_lip_neg[:, p1])
+            sweep_update = max(sweep_update, float(np.max(np.abs(delta))))
             lam_lip_neg[:, p1] += delta
             x[:, p1] -= delta
             x[:, p2] += delta
-        # The stopping criteria are evaluated every few sweeps.  The operative
-        # one is primal feasibility (the point is already feasible to the cone
-        # tolerance once the creeping multipliers settle); ``max_sweeps`` caps
-        # the pathological all-constraints-active case.  Both are deterministic
-        # functions of the data, so the sweep count is reproducible.
-        if it % 25 == 0:
-            viol = max(
-                float(np.max(np.maximum(-x, 0.0))),
-                float(np.max(np.maximum(x - high_bound[None, :], 0.0))),
-                float(np.max(np.maximum(np.abs(np.diff(x, axis=1)) - s, 0.0))),
-            )
-            if viol < viol_tol:
-                break
+
+        last_viol = max(
+            float(np.max(np.maximum(-x, 0.0))),
+            float(np.max(np.abs(x[:, 0]))),
+            float(np.max(np.maximum(np.abs(np.diff(x, axis=1)) - s, 0.0))),
+        )
+        last_update = sweep_update
+        if last_viol <= viol_tol and last_update <= update_tol:
+            converged = True
+            break
+
+    if not converged:
+        raise RuntimeError(
+            "Hildreth projection did not converge: "
+            f"primal_violation={last_viol:.3e}, "
+            f"max_dual_update={last_update:.3e}, sweeps={int(max_sweeps)}"
+        )
     return x.reshape(shape)
 
 
@@ -356,11 +365,11 @@ class TopoStep1:
     """Frozen Maroulas Step-1 model, calibrated on the Phase-6 calibration sample.
 
     ``prior`` and ``clutter`` are ``bayes_tda`` ``RGaussianMixture`` objects
-    elicited from the *observed* diagrams of the calibration sample (pooled
-    across arms without the treatment label); ``sigma_dyo`` is the
-    empirical-Bayes marginal-likelihood optimum of the fit split, re-scored on
-    a subject-disjoint hold-out split by predictive PPP log-density, then
-    frozen.  ``selection`` carries the full audit trail.
+    fitted from paired clean and observed calibration diagrams, respectively,
+    with arm labels pooled out.  Prior complexity, clutter scale, ``alpha`` and
+    ``sigma_dyo`` are selected by subject-disjoint held-out predictive log score
+    for the clean diagram conditional on its paired observation.  The selected
+    structure is refitted on the full calibration sample and frozen.
     """
 
     prior: object
@@ -387,14 +396,8 @@ class TopoStep1:
         }
 
 
-def _calibration_observed_diagrams(cfg: MEUQConfig):
-    """Observed Alpha diagrams of the calibration sample (both arms, pooled).
-
-    Regenerated with exactly the seeds and subsampling order of
-    ``measurement_error_uq._calibration_curves`` so M6's calibration resource
-    is the *same* 240-subject paired sample the bridge is fitted on (minus the
-    clean curves, which the diagram-space model does not consume).
-    """
+def _calibration_paired_diagrams(cfg: MEUQConfig):
+    """Paired observed/clean Alpha diagrams from the Phase-6 calibration sample."""
     key = _noise_key(cfg.noise_level)
     ds = generate_synthetic_dataset(dgp_config(
         cfg, n=int(cfg.n_calibration_subjects),
@@ -402,57 +405,128 @@ def _calibration_observed_diagrams(cfg: MEUQConfig):
         noise_seed=_seed_int(cfg.seeds.calibration, 2, key),
     ))
     rng = _rng(cfg.seeds.calibration, 3, key)
-    diagrams, subject_ids = [], []
+    observed, clean, subject_ids = [], [], []
     for i in range(ds.clouds.shape[0]):
         for arm in (0, 1):
             noisy = _subsample(ds.clouds[i, arm], cfg.max_points, rng)
-            diagrams.append(alpha_diagram(noisy))
+            latent = _subsample(ds.clean_clouds[i, arm], cfg.max_points, rng)
+            observed.append(alpha_diagram(noisy))
+            clean.append(alpha_diagram(latent))
             subject_ids.append(i)
-    return diagrams, np.asarray(subject_ids, dtype=int)
+    return observed, clean, np.asarray(subject_ids, dtype=int)
 
 
-def _holdout_predictive_loglik(candidates, holdout_bp, prior, clutter,
-                               alpha: float) -> np.ndarray:
-    """Mean predictive marked-PPP log-likelihood of held-out diagrams.
+def _scaled_mixture(mixture, weight_scale: float):
+    """Copy a restricted Gaussian mixture while scaling its intensity mass."""
+    from bayes_tda.intensities import RGaussianMixture
 
-    This is the same functional ``select_sigma_dyo`` maximises, evaluated on
-    data the selection did not see: the observed hold-out diagrams' PPP
-    log-likelihood under the model with observation-noise variance
-    ``sigma_dyo = candidates[k]``.  Up to ``sigma``-independent constants, so
-    only differences across candidates are meaningful.
+    return RGaussianMixture(
+        mus=np.asarray(mixture.mus, dtype=float).copy(),
+        sigmas=np.asarray(mixture.sigmas, dtype=float).copy(),
+        weights=float(weight_scale) * np.asarray(mixture.weights, dtype=float),
+        normalize_weights=False,
+        tilted=bool(getattr(mixture, "tilted", True)),
+        min_birth=float(getattr(mixture, "min_birth", 0.0)),
+        fastQ=bool(getattr(mixture, "fastQ", False)),
+    )
+
+
+def _prior_component_grid(clean_diagrams_bp) -> tuple[int, ...]:
+    cards = np.asarray([len(np.asarray(d)) for d in clean_diagrams_bp], dtype=float)
+    centre = max(1, int(round(float(cards.mean()))))
+    return tuple(sorted({max(1, centre // 2), centre, max(1, 2 * centre)}))
+
+
+def _sampler_spatial_log_density(step1: TopoStep1, observed_bp, points_bp):
+    """Log spatial density induced by :class:`PosteriorDiagramSampler`.
+
+    Component masses include their wedge-acceptance probabilities, matching the
+    sampler's rejection step.  This deliberately scores the distribution that
+    M6 actually draws from rather than the vendored intensity's inconsistent
+    ``sigma`` convention.
     """
-    from btate.topo_posterior.eb import sigma_dyo_profile_loglik
+    from scipy.stats import norm
 
-    scores = np.empty(len(candidates), dtype=float)
-    for k, s in enumerate(candidates):
-        scores[k] = sigma_dyo_profile_loglik(holdout_bp, prior, clutter,
-                                             float(s), alpha=alpha)
-    return scores
+    post = fast_subject_posterior(step1, observed_bp)
+    means = [np.atleast_2d(np.asarray(post.posterior_means, dtype=float))]
+    variances = [np.asarray(post.posterior_sigmas, dtype=float).ravel()]
+    coeffs = [step1.alpha * np.asarray(post.Cs, dtype=float).ravel()]
+    if step1.alpha < 1.0:
+        means.append(np.atleast_2d(np.asarray(step1.prior.mus, dtype=float)))
+        variances.append(np.asarray(step1.prior.sigmas, dtype=float).ravel())
+        coeffs.append((1.0 - step1.alpha) *
+                      np.asarray(step1.prior.weights, dtype=float).ravel())
+
+    means = np.vstack(means)
+    variances = np.concatenate(variances)
+    coeffs = np.concatenate(coeffs)
+    std = np.sqrt(variances)
+    wedge_mass = (
+        norm.cdf((means[:, 0] - step1.min_birth) / std)
+        * norm.cdf(means[:, 1] / std)
+    )
+    total_mass = float(np.sum(coeffs * wedge_mass))
+    if not np.isfinite(total_mass) or total_mass <= 0.0:
+        return np.full(len(points_bp), -1e12, dtype=float)
+
+    pts = np.atleast_2d(np.asarray(points_bp, dtype=float))
+    d2 = ((pts[:, None, :] - means[None, :, :]) ** 2).sum(axis=2)
+    density = (
+        np.exp(-0.5 * d2 / variances[None, :])
+        / (2.0 * np.pi * variances[None, :])
+    ) @ coeffs
+    inside = (pts[:, 0] >= step1.min_birth) & (pts[:, 1] > 0.0)
+    density = np.where(inside, density / total_mass, 0.0)
+    return np.log(np.maximum(density, 1e-300))
+
+
+def _conditional_clean_logscore(
+    step1: TopoStep1, observed_bp, clean_bp,
+) -> float:
+    """Proper log score for a clean diagram conditional on its observation.
+
+    It is the Poisson-cardinality plus normalized spatial log probability of
+    the exact finite-point-process sampler used by M6.
+    """
+    from scipy.special import gammaln
+
+    observed_bp = np.atleast_2d(np.asarray(observed_bp, dtype=float))
+    clean_bp = np.atleast_2d(np.asarray(clean_bp, dtype=float))
+    n_obs = 0 if np.asarray(observed_bp).size == 0 else int(observed_bp.shape[0])
+    n_clean = 0 if np.asarray(clean_bp).size == 0 else int(clean_bp.shape[0])
+    if n_obs == 0:
+        return 0.0 if n_clean == 0 else -1e12
+    log_cardinality = (
+        -float(n_obs) + n_clean * np.log(float(n_obs)) - float(gammaln(n_clean + 1))
+    )
+    if n_clean == 0:
+        return log_cardinality
+    return log_cardinality + float(np.sum(
+        _sampler_spatial_log_density(step1, observed_bp, clean_bp)
+    ))
 
 
 def fit_topo_step1(cfg: MEUQConfig, grid) -> TopoStep1:
-    """Fit and freeze the M6 Step-1 model on the calibration sample.
+    """Fit and freeze validation-calibrated M6 on paired diagrams.
 
     Registered selection rule (fixed before any evaluation replicate runs):
 
-    1. prior/clutter: pooled k-means elicitation (``elicit_prior_clutter``,
-       Phase-4.25 defaults, ``min_birth=0``) on the **fit split** of the
-       calibration observed diagrams, split subject-disjointly with the same
-       stream the bridge uses;
-    2. ``sigma_dyo``: the empirical-Bayes marginal-likelihood profile
-       (``select_sigma_dyo``, grid of ``median(prior.sigmas)`` multipliers) on
-       the fit split, re-scored on the hold-out split by predictive PPP
-       log-likelihood; the argmax is frozen;
-    3. the final posterior is refitted on the **full** calibration sample with
-       the frozen ``sigma_dyo`` (mirroring the bridge's refit-on-full step).
+    1. split subjects, never curves, into fit and hold-out sets;
+    2. elicit candidate latent priors from fit-clean diagrams and a clutter
+       template from fit-observed diagrams, without treatment labels;
+    3. select prior component count, clutter intensity scale, ``alpha`` and a
+       scale-free ``sigma_dyo`` multiplier by the mean conditional predictive
+       log score of hold-out-clean diagrams given hold-out-observed diagrams;
+    4. refit prior and clutter on every calibration pair using the selected
+       structure, transfer the selected sigma multiplier to the refitted prior
+       scale, and freeze the result before evaluation.
     """
-    from bayes_tda.intensities import Posterior
-
     if not 0.0 < cfg.calibration_holdout_frac < 0.9:
         raise ValueError("calibration_holdout_frac must be in (0, 0.9)")
     key = _noise_key(cfg.noise_level)
-    diagrams_bd, subject_ids = _calibration_observed_diagrams(cfg)
-    diagrams_bp = [bd_to_bp(d) for d in diagrams_bd]
+    observed_bd, clean_bd, subject_ids = _calibration_paired_diagrams(cfg)
+    observed_bp = [bd_to_bp(d) for d in observed_bd]
+    clean_bp = [bd_to_bp(d) for d in clean_bd]
 
     uniq = np.unique(subject_ids)
     rng9 = _rng(cfg.seeds.calibration, 9, key)
@@ -460,42 +534,102 @@ def fit_topo_step1(cfg: MEUQConfig, grid) -> TopoStep1:
     n_hold = max(1, int(round(cfg.calibration_holdout_frac * uniq.size)))
     hold_subjects = set(perm[:n_hold].tolist())
     fit_mask = np.array([sid not in hold_subjects for sid in subject_ids])
-    fit_bp = [d for d, m in zip(diagrams_bp, fit_mask) if m]
-    hold_bp = [d for d, m in zip(diagrams_bp, fit_mask) if not m]
-    if len(fit_bp) < 4 or len(hold_bp) < 2:
-        raise ValueError("calibration sample is too small to select sigma_dyo")
+    obs_fit = [d for d, m in zip(observed_bp, fit_mask) if m]
+    clean_fit = [d for d, m in zip(clean_bp, fit_mask) if m]
+    obs_hold = [d for d, m in zip(observed_bp, fit_mask) if not m]
+    clean_hold = [d for d, m in zip(clean_bp, fit_mask) if not m]
+    if len(obs_fit) < 4 or len(obs_hold) < 2:
+        raise ValueError("calibration sample is too small for paired selection")
 
-    prior, clutter = elicit_prior_clutter(
-        fit_bp, min_birth=0.0,
+    component_grid = _prior_component_grid(clean_fit)
+    _, clutter_template = elicit_prior_clutter(
+        obs_fit, n_components=1, clutter_n_components=1, min_birth=0.0,
         random_state=_seed_int(cfg.seeds.calibration, 10, key),
     )
-    profile = select_sigma_dyo(fit_bp, prior, clutter, alpha=1.0)
-    candidates = np.asarray(profile["profile_sigma_dyo"], dtype=float)
-    scores = _holdout_predictive_loglik(candidates, hold_bp, prior, clutter,
-                                        alpha=1.0)
-    best = int(np.argmax(scores))
-    sigma = float(candidates[best])
+
+    records: list[dict] = []
+    for n_components in component_grid:
+        prior_fit, _ = elicit_prior_clutter(
+            clean_fit, n_components=int(n_components), min_birth=0.0,
+            random_state=_seed_int(cfg.seeds.calibration, 11, key,
+                                   int(n_components)),
+        )
+        prior_median = float(np.median(np.asarray(prior_fit.sigmas, dtype=float)))
+        for clutter_scale in M6_CLUTTER_SCALE_GRID:
+            clutter_fit = _scaled_mixture(clutter_template, clutter_scale)
+            for alpha in M6_ALPHA_GRID:
+                for sigma_multiplier in M6_SIGMA_MULTIPLIER_GRID:
+                    sigma = max(1e-8, float(sigma_multiplier) * prior_median)
+                    candidate = TopoStep1(
+                        prior=prior_fit, clutter=clutter_fit, sigma_dyo=sigma,
+                        alpha=float(alpha), min_birth=0.0,
+                        sample_range=grid.sample_range,
+                        resolution=int(grid.resolution), r=float(grid.r),
+                        n_calibration_curves=int(len(observed_bp)),
+                    )
+                    pair_scores = [
+                        _conditional_clean_logscore(candidate, obs, clean)
+                        for obs, clean in zip(obs_hold, clean_hold)
+                    ]
+                    records.append({
+                        "prior_components": int(n_components),
+                        "clutter_scale": float(clutter_scale),
+                        "alpha": float(alpha),
+                        "sigma_multiplier": float(sigma_multiplier),
+                        "sigma_dyo_fit": float(sigma),
+                        "holdout_clean_conditional_logscore": float(
+                            np.mean(pair_scores)),
+                    })
+
+    best = max(records, key=lambda row: row["holdout_clean_conditional_logscore"])
+
+    prior_full, _ = elicit_prior_clutter(
+        clean_bp, n_components=int(best["prior_components"]), min_birth=0.0,
+        random_state=_seed_int(cfg.seeds.calibration, 12, key),
+    )
+    _, clutter_full_template = elicit_prior_clutter(
+        observed_bp, n_components=1, clutter_n_components=1, min_birth=0.0,
+        random_state=_seed_int(cfg.seeds.calibration, 13, key),
+    )
+    clutter_full = _scaled_mixture(clutter_full_template, best["clutter_scale"])
+    prior_sigma_median = float(np.median(
+        np.asarray(prior_full.sigmas, dtype=float)))
+    sigma_full = max(1e-8, float(best["sigma_multiplier"]) * prior_sigma_median)
 
     selection = {
-        "rule": "eb_marginal_likelihood_on_fit_split_rescored_on_holdout_split",
-        "n_fit_curves": int(len(fit_bp)),
-        "n_holdout_curves": int(len(hold_bp)),
-        "prior_components": int(prior.mus.shape[0]),
-        "eb_sigma_dyo": float(profile["sigma_dyo"]),
-        "eb_sigma_dyo_multiplier": float(profile["sigma_dyo_multiplier"]),
-        "eb_at_boundary": bool(profile["at_boundary"]),
-        "selected_sigma_dyo": sigma,
-        "selected_sigma_dyo_multiplier": float(sigma / profile["prior_sigma_median"]),
-        "prior_sigma_median": float(profile["prior_sigma_median"]),
-        "holdout_loglik_eb_winner": float(scores[best]),
-        "holdout_loglik_range": [float(scores.min()), float(scores.max())],
-        "alpha": 1.0,
+        "rule": "paired_clean_conditional_logscore_subject_holdout_then_full_refit",
+        "uses_paired_clean_diagrams": True,
+        "arm_labels_used": False,
+        "n_fit_pairs": int(len(obs_fit)),
+        "n_holdout_pairs": int(len(obs_hold)),
+        "fit_subject_ids": sorted(int(v) for v in uniq if v not in hold_subjects),
+        "holdout_subject_ids": sorted(int(v) for v in hold_subjects),
+        "prior_component_grid": list(component_grid),
+        "clutter_scale_grid": list(M6_CLUTTER_SCALE_GRID),
+        "alpha_grid": list(M6_ALPHA_GRID),
+        "sigma_multiplier_grid": list(M6_SIGMA_MULTIPLIER_GRID),
+        "n_candidates": int(len(records)),
+        "prior_components": int(best["prior_components"]),
+        "selected_clutter_scale": float(best["clutter_scale"]),
+        "alpha": float(best["alpha"]),
+        "selected_sigma_dyo": float(sigma_full),
+        "selected_sigma_dyo_multiplier": float(best["sigma_multiplier"]),
+        "prior_sigma_median": prior_sigma_median,
+        "holdout_clean_conditional_logscore": float(
+            best["holdout_clean_conditional_logscore"]),
+        "holdout_logscore_range": [
+            float(min(r["holdout_clean_conditional_logscore"] for r in records)),
+            float(max(r["holdout_clean_conditional_logscore"] for r in records)),
+        ],
+        "refit_on_full_calibration_sample": True,
+        "candidate_scores": records,
     }
     return TopoStep1(
-        prior=prior, clutter=clutter, sigma_dyo=sigma, alpha=1.0,
+        prior=prior_full, clutter=clutter_full, sigma_dyo=sigma_full,
+        alpha=float(best["alpha"]),
         min_birth=0.0, sample_range=grid.sample_range,
         resolution=int(grid.resolution), r=float(grid.r),
-        n_calibration_curves=int(len(diagrams_bp)), selection=selection,
+        n_calibration_curves=int(len(observed_bp)), selection=selection,
     )
 
 
@@ -675,7 +809,7 @@ def method_me_topo_point(cfg: MEUQConfig, observed, step1: TopoStep1,
 def method_me_topo_posterior_proj(cfg: MEUQConfig, observed, step1: TopoStep1,
                                   cone: SilhouetteCone, rep: int,
                                   draws=None) -> MethodResult:
-    """M6-proj -- M6 with each posterior draw projected onto the C1-C4 cone."""
+    """M6-proj -- M6 projected onto the unconditional C1-C3 polyhedron."""
     from btate.causal.propagation import nested_posterior_tate
 
     key = _noise_key(cfg.noise_level)
@@ -695,7 +829,7 @@ def method_me_topo_posterior_proj(cfg: MEUQConfig, observed, step1: TopoStep1,
 
 
 # --------------------------------------------------------------------------- #
-# Cone-projected bridge arms (Task 6.25.3)
+# Polyhedron-projected bridge arms (Task 6.25.3)
 # --------------------------------------------------------------------------- #
 def _bridge_draws(cfg: MEUQConfig, observed, bridge, rep: int,
                   stream_part: int) -> np.ndarray:
@@ -711,7 +845,7 @@ def _bridge_draws(cfg: MEUQConfig, observed, bridge, rep: int,
 
 def method_me_bayes_bridge_proj(cfg: MEUQConfig, observed, bridge,
                                 cone: SilhouetteCone, rep: int) -> MethodResult:
-    """M4-proj -- M4 with every bridge draw projected onto the C1-C4 cone.
+    """M4-proj -- M4 projected onto the unconditional C1-C3 polyhedron.
 
     Shares the draw, causal and bootstrap streams of M4 bit-for-bit; the
     projection is the only difference.
@@ -735,7 +869,7 @@ def method_me_bayes_bridge_proj(cfg: MEUQConfig, observed, bridge,
 
 def method_me_freq_mi_proj(cfg: MEUQConfig, observed, bridge,
                            cone: SilhouetteCone, rep: int) -> MethodResult:
-    """M5-proj -- M5 with every imputation projected onto the C1-C4 cone."""
+    """M5-proj -- M5 projected onto the unconditional C1-C3 polyhedron."""
     from btate.benchmarks.frequentist import cross_fitted_scores
     from btate.benchmarks.measurement_error_uq import multiple_imputation_band
 
@@ -768,13 +902,31 @@ def p625_methods(cfg: MEUQConfig) -> tuple[str, ...]:
 
 def prepare_cell_p625(cfg: MEUQConfig, cache_dir: str | Path | None = None,
                       verbose: bool = False) -> dict:
-    """Phase-6.25 cell preparation: Phase-6 artifacts plus Step-1 and the cone.
+    """Phase-6.25 preparation with a versioned, reloadable binary cache.
 
     Everything is computed from seed namespaces disjoint from the evaluation
     replicates.  ``grid``, ``targets`` and ``bridges`` come from
     ``prepare_cell`` unchanged; ``step1`` is the frozen M6 Step-1 model and
-    ``cone`` the C1-C4 valid-silhouette cone on the frozen grid.
+    ``cone`` the C1-C3 valid-silhouette polyhedron on the frozen grid.
     """
+    cache_path = json_path = None
+    if cache_dir is not None:
+        path = Path(cache_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        signature = hashlib.sha256(json.dumps({
+            "cache_version": P625_CACHE_VERSION,
+            "config": cfg.to_dict(),
+        }, sort_keys=True).encode()).hexdigest()[:16]
+        tag = f"noise{_noise_key(cfg.noise_level):06d}_res{cfg.resolution}_{signature}"
+        cache_path = path / f"p625_prepared_{tag}.pkl"
+        json_path = path / f"p625_prepared_{tag}.json"
+        if cache_path.exists():
+            with cache_path.open("rb") as handle:
+                out = pickle.load(handle)
+            if verbose:
+                print(f"[prepare] loaded Phase-6.25 cache: {cache_path}")
+            return out
+
     prepared = prepare_cell(cfg, cache_dir=cache_dir, verbose=verbose)
     t0 = time.perf_counter()
     step1 = fit_topo_step1(cfg, prepared["grid"])
@@ -783,19 +935,21 @@ def prepare_cell_p625(cfg: MEUQConfig, cache_dir: str | Path | None = None,
         sel = step1.selection
         print(f"[step1] sigma_DYO={step1.sigma_dyo:.6g} "
               f"(mult {sel['selected_sigma_dyo_multiplier']:.4g}, "
-              f"eb_winner {sel['eb_sigma_dyo']:.6g}) "
+              f"alpha {sel['alpha']:.3g}, clutter {sel['selected_clutter_scale']:.3g}) "
               f"prior_components={sel['prior_components']} "
-              f"holdout_loglik={sel['holdout_loglik_eb_winner']:.4g} "
+              f"holdout_clean_logscore={sel['holdout_clean_conditional_logscore']:.4g} "
               f"({time.perf_counter() - t0:.0f}s)")
-        print(f"[cone]  C2 slope={cone.slope:.6g} C3 bound={cone.height_bound:.6g}")
+        print(f"[polyhedron] C2 slope={cone.slope:.6g}; C3 pins only t=0")
 
     out = {"config": cfg, "grid": prepared["grid"], "targets": prepared["targets"],
            "bridges": prepared["bridges"], "step1": step1, "cone": cone}
-    if cache_dir is not None:
-        path = Path(cache_dir)
-        path.mkdir(parents=True, exist_ok=True)
-        tag = f"noise{_noise_key(cfg.noise_level):06d}_res{cfg.resolution}"
-        (path / f"p625_prepared_{tag}.json").write_text(json.dumps({
+    if cache_path is not None and json_path is not None:
+        tmp_path = cache_path.with_suffix(".tmp")
+        with tmp_path.open("wb") as handle:
+            pickle.dump(out, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        tmp_path.replace(cache_path)
+        json_path.write_text(json.dumps({
+            "cache_version": P625_CACHE_VERSION,
             "config": cfg.to_dict(),
             "grid": prepared["grid"].to_dict(),
             "targets": prepared["targets"].to_dict(),
@@ -810,7 +964,7 @@ def _latent_draw_sources(cfg: MEUQConfig, observed, bridges, step1, rep,
                          cone: SilhouetteCone) -> dict:
     """Latent clean curves per arm, with the arms' exact seed streams.
 
-    Used by the cone diagnostic so it measures exactly the draws the arms
+    Used by the polyhedron diagnostic so it measures exactly the draws the arms
     consumed (the base arms recompute them internally with identical streams).
     """
     sources = {
@@ -843,7 +997,10 @@ def evaluate_replicate_p625(cfg: MEUQConfig, grid, targets, bridges, step1,
         "step1_sigma_dyo": float(step1.sigma_dyo),
         "step1_sigma_dyo_multiplier": float(
             step1.selection["selected_sigma_dyo_multiplier"]),
-        "step1_holdout_loglik": float(step1.selection["holdout_loglik_eb_winner"]),
+        "step1_alpha": float(step1.alpha),
+        "step1_clutter_scale": float(step1.selection["selected_clutter_scale"]),
+        "step1_holdout_clean_logscore": float(
+            step1.selection["holdout_clean_conditional_logscore"]),
         "step1_prior_components": int(step1.selection["prior_components"]),
     }
 
@@ -902,7 +1059,7 @@ def evaluate_replicate_p625(cfg: MEUQConfig, grid, targets, bridges, step1,
         row["runtime_s"] = time.perf_counter() - t0
         rows.append(row)
 
-    # Cone diagnostics (Task 6.25.2): measured on the arms' own draw streams.
+    # Polyhedron diagnostics (Task 6.25.2), on the arms' own draw streams.
     sources = _latent_draw_sources(cfg, observed, bridges, step1, rep, cone)
     cone_columns: dict = {}
     for name, draws in sources.items():
@@ -949,18 +1106,17 @@ def run_p625_cell(cfg: MEUQConfig, rep_indices, *, cache_dir=None,
 
 def p625_cone_report(sources: dict, cone: SilhouetteCone,
                      alpha: float = 0.05) -> dict:
-    """Headline cone-violation table for one replicate set (helper for tests)."""
+    """Headline validity table for one replicate set (helper for tests)."""
     out: dict = {}
     for name, draws in sources.items():
         stats = cone_violation_stats(draws, cone)
         out[name] = {
-            "any_rate": stats["cone_viol_any_rate"],
-            "c1_rate": stats["cone_viol_c1_rate"],
-            "c2_rate": stats["cone_viol_c2_rate"],
-            "c3_rate": stats["cone_viol_c3_rate"],
-            "c4_rate": stats["cone_viol_c4_rate"],
-            "c2_worst_delta_units": stats["cone_viol_c2_mag_delta_units"],
-            "c3_worst_abs": stats["cone_viol_c3_mag"],
-            "c4_worst_abs": stats["cone_viol_c4_mag"],
+            "any_rate": stats["viol_any_rate"],
+            "c1_rate": stats["viol_c1_rate"],
+            "c2_rate": stats["viol_c2_rate"],
+            "c3_rate": stats["viol_c3_rate"],
+            "c1_worst_abs": stats["viol_c1_mag"],
+            "c2_worst_delta_units": stats["viol_c2_mag_delta_units"],
+            "c3_worst_abs": stats["viol_c3_mag"],
         }
     return out

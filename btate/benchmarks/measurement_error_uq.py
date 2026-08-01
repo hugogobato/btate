@@ -420,6 +420,41 @@ def freeze_alpha_grid(cfg: MEUQConfig) -> GridSpec:
         upper = float(cfg.grid_upper)
         dtm_upper = cfg.dtm_grid_upper
         provenance = {"source": "explicit_config"}
+        # ``grid_upper`` fixes only the Alpha axis.  P6.25 supplies the Alpha
+        # endpoint explicitly while enabling DTM as an auxiliary bridge
+        # feature, so the DTM endpoint still has to be frozen from the clean
+        # oracle sample unless the caller supplied one explicitly.
+        if cfg.use_dtm_feature and dtm_upper is None:
+            dtm_deaths: list[float] = []
+            n_dtm_clouds = 0
+            rng = _rng(cfg.seeds.truth, 3)
+            for ds in _truth_datasets(cfg, 0.0):
+                for i in range(ds.clean_clouds.shape[0]):
+                    for arm in (0, 1):
+                        if n_dtm_clouds >= cfg.dtm_grid_max_clouds:
+                            break
+                        cloud = _subsample(ds.clean_clouds[i, arm],
+                                           cfg.max_points, rng)
+                        n_dtm_clouds += 1
+                        dgm = dtm_diagram(cloud, k=cfg.dtm_k)
+                        if dgm.size:
+                            vals = dgm[:, 1]
+                            dtm_deaths.extend(vals[np.isfinite(vals)].tolist())
+                    if n_dtm_clouds >= cfg.dtm_grid_max_clouds:
+                        break
+                if n_dtm_clouds >= cfg.dtm_grid_max_clouds:
+                    break
+            if not dtm_deaths:
+                raise RuntimeError(
+                    "oracle clean sample has no finite DTM H1 deaths")
+            dtm_upper = float(np.round(1.5 * max(dtm_deaths), 3))
+            provenance = {
+                **provenance,
+                "dtm_source": "oracle_clean_dtm_deaths",
+                "dtm_rule": "round(1.5 * max finite clean H1 death, 3)",
+                "n_dtm_feature_clouds": int(n_dtm_clouds),
+                "max_clean_dtm_death": float(max(dtm_deaths)),
+            }
     else:
         deaths: list[float] = []
         dtm_deaths: list[float] = []
@@ -1341,9 +1376,15 @@ def aggregate_me_uq(raw, alpha: float = 0.05):
     sim_columns += [c for c in raw.columns
                     if c.endswith(("cov_peak_localized_clean", "cov_peak_localized_noisy"))]
     sim_columns = sorted(set(sim_columns))
+    max_columns = [
+        c for c in raw.columns
+        if c.startswith("cone_") and "_mag" in c
+        and pd.api.types.is_numeric_dtype(raw[c])
+    ]
     mean_columns = [
         c for c in raw.columns
         if c not in sim_columns
+        and c not in max_columns
         and c not in {"noise_level", "method", "rep", "error", "estimand_primary",
                       "estimand_secondary", "band_kind"}
         and pd.api.types.is_numeric_dtype(raw[c])
@@ -1369,6 +1410,10 @@ def aggregate_me_uq(raw, alpha: float = 0.05):
             values = ok[column].to_numpy(dtype=float)
             values = values[np.isfinite(values)]
             row[f"{column}_mean"] = float(np.mean(values)) if values.size else float("nan")
+        for column in max_columns:
+            values = ok[column].to_numpy(dtype=float)
+            values = values[np.isfinite(values)]
+            row[f"{column}_max"] = float(np.max(values)) if values.size else float("nan")
         rows.append(row)
     return pd.DataFrame(rows).sort_values(["noise_level", "method"]).reset_index(drop=True)
 

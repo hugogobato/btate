@@ -320,5 +320,5 @@ this document.
 (`dist/btate-github`). Commit hash (of the commit containing this exact file):
 
 ```
-PENDING — filled at commit time
+a9a2f0187e3b97a7a53a25cb5a680abe8d5644ee
 ```

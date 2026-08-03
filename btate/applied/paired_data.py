@@ -18,8 +18,10 @@ import numpy as np
 
 from .representation import (
     FrozenFrame,
+    alpha_diagram,
     alpha_curve_on_grid,
     dtm_curve_on_grid,
+    silhouette_on_grid,
 )
 
 # --------------------------------------------------------------------------- #
@@ -102,6 +104,7 @@ class UnitCurves:
     thinned_alpha: dict[float, np.ndarray]
     thinned_dtm: dict[tuple[float, int], np.ndarray]
     cardinality_drop: dict[float, int] = field(default_factory=dict)
+    geometry: dict[float, dict] = field(default_factory=dict)
 
     def curves_for(self, p: float, use_dtm: bool = False,
                    dtm_k: int | None = None) -> tuple[np.ndarray, np.ndarray | None]:
@@ -273,18 +276,26 @@ def unit_curves(adata, row, frame: FrozenFrame, grid, *,
     unit_key = f"{plate}:{well}"
     full_cloud, full_barcodes, full_counts = unit_full_cloud(
         adata, row, frame, n_points=n_points, subsample_seed=subsample_seed)
-    full_alpha = alpha_curve_on_grid(full_cloud, grid)
+    full_diagram = alpha_diagram(full_cloud)
+    full_alpha = silhouette_on_grid(
+        full_diagram, grid.sample_range, grid.resolution, grid.r)
 
     thinned_alpha: dict[float, np.ndarray] = {}
     thinned_dtm: dict[tuple[float, int], np.ndarray] = {}
     cardinality_drop: dict[float, int] = {}
+    geometry: dict[float, dict] = {}
     for p in p_ladder:
         thin = thin_csr_rows(full_counts, full_barcodes, float(p))
         t_totals = np.asarray(thin.sum(axis=1)).ravel()
         alive_t = np.flatnonzero(t_totals > 0)
         cardinality_drop[float(p)] = int(full_counts.shape[0] - alive_t.size)
         t_cloud = frame.unit_cloud(thin[alive_t])
-        thinned_alpha[float(p)] = alpha_curve_on_grid(t_cloud, grid)
+        thin_diagram = alpha_diagram(t_cloud)
+        thinned_alpha[float(p)] = silhouette_on_grid(
+            thin_diagram, grid.sample_range, grid.resolution, grid.r)
+        geometry[float(p)] = corruption_geometry_diagnostics(
+            full_cloud, t_cloud, full_diagram, thin_diagram,
+            grid_upper=float(grid.sample_range[1]))
         for k in dtm_k_ladder:
             thinned_dtm[(float(p), int(k))] = dtm_curve_on_grid(t_cloud, grid, int(k))
 
@@ -295,6 +306,7 @@ def unit_curves(adata, row, frame: FrozenFrame, grid, *,
         thinned_alpha=thinned_alpha,
         thinned_dtm=thinned_dtm,
         cardinality_drop=cardinality_drop,
+        geometry=geometry,
     )
 
 
@@ -316,11 +328,11 @@ def corruption_geometry_diagnostics(full_cloud, thinned_cloud,
     d_h = max(float(directed_hausdorff(full, thin)[0]),
               float(directed_hausdorff(thin, full)[0]))
 
+    from scipy.stats import wasserstein_distance
+
     w1 = []
     for c in range(full.shape[1]):
-        a = np.sort(full[:, c])
-        b = np.sort(thin[:, c])
-        w1.append(float(np.mean(np.abs(a - b))))
+        w1.append(float(wasserstein_distance(full[:, c], thin[:, c])))
     w1_mean = float(np.mean(w1)) if w1 else float("nan")
 
     n_full = full_diagram.shape[0]

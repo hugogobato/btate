@@ -147,10 +147,12 @@ def select_dtm_k(cfg: RealEvaluationConfig, grid, calibration: list,
     Returns ``{"dtm": bridge_at_k*, "selected_k": k*, "k_selection": {...}}``.
     """
     record: dict = {}
+    bridges_by_k: dict[int, MeasurementBridge] = {}
     best_score = -np.inf
     best = None
     for k in cfg.dtm_k_ladder:
         br = fit_bridge(cfg, grid, calibration, p, int(k))
+        bridges_by_k[int(k)] = br
         score = float(br.diagnostics["selected_holdout_logpdf"])
         record[int(k)] = {
             "holdout_logpdf": score,
@@ -162,8 +164,9 @@ def select_dtm_k(cfg: RealEvaluationConfig, grid, calibration: list,
         }
         if score > best_score:
             best_score, best = score, br
-    return {"dtm": best, "selected_k": int(max(record, key=lambda k: record[k]["holdout_logpdf"])),
-            "k_selection": record}
+    selected_k = int(max(record, key=lambda k: record[k]["holdout_logpdf"]))
+    return {"dtm": best, "selected_k": selected_k,
+            "k_selection": record, "bridges_by_k": bridges_by_k}
 
 
 def fit_all_bridges(cfg: RealEvaluationConfig, grid,
@@ -178,6 +181,7 @@ def fit_all_bridges(cfg: RealEvaluationConfig, grid,
             "dtm": selection["dtm"],
             "selected_k": selection["selected_k"],
             "k_selection": selection["k_selection"],
+            "bridges_by_k": selection["bridges_by_k"],
         }
     return bridges
 
@@ -343,6 +347,20 @@ def evaluate_replicate(cfg: RealEvaluationConfig, grid, *, rep: int,
                 lambda: _mi_band(cfg, bridges[float(p)]["dtm"], phi_p,
                                  phi_dtm_p, A_rep, X_rep, grid_arr, rep, k_star),
         }
+        if float(p) == float(cfg.primary_p):
+            for k in cfg.dtm_k_ladder:
+                k = int(k)
+                phi_dtm_k = np.stack(
+                    [eval_curves[i].thinned_dtm[(float(p), k)] for i in idx])
+                bridge_k = bridges[float(p)]["bridges_by_k"][k]
+                arms[f"M4_dtm_k{k}_bridge_bayes"] = (
+                    lambda bridge_k=bridge_k, phi_dtm_k=phi_dtm_k, k=k:
+                    _nested_band(cfg, bridge_k, phi_p, phi_dtm_k, A_rep,
+                                 X_rep, grid_arr, rep, k))
+                arms[f"M5_dtm_k{k}_bridge_freq_mi"] = (
+                    lambda bridge_k=bridge_k, phi_dtm_k=phi_dtm_k, k=k:
+                    _mi_band(cfg, bridge_k, phi_p, phi_dtm_k, A_rep, X_rep,
+                             grid_arr, rep, k))
         for method, runner in arms.items():
             try:
                 band = runner()

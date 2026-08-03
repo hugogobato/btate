@@ -44,11 +44,19 @@ from .paired_data import (
     unit_curves,
 )
 from .representation import (
-    REPRESENTATION_HASH,
+REPRESENTATION_HASH,
     FrameConfig,
     fit_frame,
     freeze_grid,
 )
+
+
+def _json_default(value):
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    raise TypeError(f"not JSON serializable: {type(value).__name__}")
 
 
 def _stratified_calibration_cells(obs, split, cap: int, seed: int) -> np.ndarray:
@@ -274,10 +282,21 @@ def run(out_dir, *, h5ad_path: str, n_jobs: int = 1, n_points: int = 60,
     if verbose:
         print("bridges ...")
     bridges = fit_all_bridges(eval_cfg, grid, list(cal_curves.values()))
+    bridge_artifacts = {}
     for p, d in bridges.items():
         print(f"  p={p}: k*={d['selected_k']} "
               f"alpha logpdf={d['alpha'].diagnostics['selected_holdout_logpdf']:.3f} "
               f"rmse={d['alpha'].diagnostics['holdout_clean_alpha_rmse']:.4f}")
+        bridge_artifacts[str(p)] = {
+            "selected_k": int(d["selected_k"]),
+            "alpha": d["alpha"].to_dict(),
+            "dtm_selected": d["dtm"].to_dict(),
+            "dtm_by_k": {str(k): br.to_dict()
+                         for k, br in d["bridges_by_k"].items()},
+            "k_selection": d["k_selection"],
+        }
+    (out_dir / "bridge_diagnostics.json").write_text(json.dumps(
+        bridge_artifacts, indent=2, default=_json_default))
 
     # 4. fixed full-depth estimand and the replicate evaluation.
     A = split["treated"][split["evaluation"]].astype(int)
@@ -313,6 +332,36 @@ def run(out_dir, *, h5ad_path: str, n_jobs: int = 1, n_points: int = 60,
         artifacts, indent=2, default=str))
     frame_df.to_csv(out_dir / "replicate_rows.csv", index=False)
     agg.to_csv(out_dir / "aggregate.csv", index=False)
+    dtm_ablation = frame_df[
+        frame_df["method"].astype(str).str.contains("_dtm_k")
+    ].copy()
+    dtm_ablation.to_csv(out_dir / "dtm_ablation_rows.csv", index=False)
+    aggregate_dtm = aggregate_cov(dtm_ablation)
+    aggregate_dtm.to_csv(out_dir / "dtm_ablation_aggregate.csv", index=False)
+
+    geometry_rows = []
+    for source, curves_to_report in (
+            ("calibration", list(cal_curves.values())),
+            ("evaluation", ev_curves)):
+        for curve in curves_to_report:
+            for p, diagnostic in curve.geometry.items():
+                geometry_rows.append({
+                    "source": source,
+                    "unit_id": curve.unit_id,
+                    "p": float(p),
+                    **diagnostic,
+                })
+    import pandas as pd
+    geometry_frame = pd.DataFrame(geometry_rows)
+    geometry_frame.to_csv(out_dir / "corruption_geometry.csv", index=False)
+    if not geometry_frame.empty:
+        numeric = geometry_frame.select_dtypes(include=[np.number])
+        geometry_summary = geometry_frame[["source", "p"]].copy()
+        summary = numeric.groupby([geometry_frame["source"],
+                                   geometry_frame["p"]]).mean()
+        geometry_summary = summary.reset_index()
+        geometry_summary.to_csv(out_dir / "corruption_geometry_summary.csv",
+                                index=False)
     np.save(out_dir / "psi_full.npy", psi)
     return artifacts
 

@@ -195,9 +195,21 @@ def run_pilot(out_dir, *, h5ad_path: str, n_points: int = 60,
     return artifacts
 
 
-def run(out_dir, *, h5ad_path: str, n_jobs: int = 1, n_points: int = 60,
-        n_replicates: int = 100, n_rep: int = 20, frame_cap: int = 50_000,
-        max_calib: int = 0, verbose: bool = True) -> dict:
+def build_context(out_dir, *, h5ad_path: str, n_jobs: int = 1,
+                  n_points: int = 60, n_replicates: int = 100, n_rep: int = 20,
+                  frame_cap: int = 50_000, max_calib: int = 0,
+                  verbose: bool = True) -> dict:
+    """Everything upstream of the replicate evaluation, in registered order.
+
+    This is the expensive prefix (frozen frame, frozen grids, all unit curves,
+    all bridges) shared by the registered seven-arm run and by the Task-6.5.5
+    control run.  Seeds and call order are identical in both, so the numbers a
+    control run reproduces are bit-comparable with the registered run.
+
+    Returns the split, unit table, frame, grid, evaluation curves, calibration
+    curves and fitted bridges, and writes ``frame.npz``, ``grid.json`` and
+    ``bridge_diagnostics.json`` into ``out_dir``.
+    """
     pin_blas_threads(1)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -298,6 +310,37 @@ def run(out_dir, *, h5ad_path: str, n_jobs: int = 1, n_points: int = 60,
     (out_dir / "bridge_diagnostics.json").write_text(json.dumps(
         bridge_artifacts, indent=2, default=_json_default))
 
+    return {
+        "adata_path": h5ad_path,
+        "split": split,
+        "units": units,
+        "ev_idx": ev_idx,
+        "cal_idx": cal_idx,
+        "frame": frame,
+        "grid": grid,
+        "ev_curves": ev_curves,
+        "cal_curves": cal_curves,
+        "bridges": bridges,
+        "eval_cfg": eval_cfg,
+        "frame_cells": int(cell_idx.size),
+        "t0": t0,
+    }
+
+
+def run(out_dir, *, h5ad_path: str, n_jobs: int = 1, n_points: int = 60,
+        n_replicates: int = 100, n_rep: int = 20, frame_cap: int = 50_000,
+        max_calib: int = 0, verbose: bool = True) -> dict:
+    out_dir = Path(out_dir)
+    ctx = build_context(out_dir, h5ad_path=h5ad_path, n_jobs=n_jobs,
+                        n_points=n_points, n_replicates=n_replicates,
+                        n_rep=n_rep, frame_cap=frame_cap, max_calib=max_calib,
+                        verbose=verbose)
+    t0 = ctx["t0"]
+    split, units, ev_idx = ctx["split"], ctx["units"], ctx["ev_idx"]
+    frame, grid = ctx["frame"], ctx["grid"]
+    ev_curves, cal_curves = ctx["ev_curves"], ctx["cal_curves"]
+    bridges, eval_cfg = ctx["bridges"], ctx["eval_cfg"]
+
     # 4. fixed full-depth estimand and the replicate evaluation.
     A = split["treated"][split["evaluation"]].astype(int)
     ev_rows = units.loc[ev_idx]
@@ -321,7 +364,7 @@ def run(out_dir, *, h5ad_path: str, n_jobs: int = 1, n_points: int = 60,
         "n_control_eval": int(split["control"].sum()),
         "n_calibration": int(split["calibration"].sum()),
         "n_excluded": int(split["excluded"].sum()),
-        "n_frame_cells": int(cell_idx.size),
+        "n_frame_cells": int(ctx["frame_cells"]),
         "n_replicates": meta["n_replicates"],
         "n_rep": meta["n_rep"],
     }
